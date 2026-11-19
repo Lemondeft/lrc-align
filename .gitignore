@@ -1,0 +1,6 @@
+/target/
+/.cargo/
+/.cuda-compat/
+*.lrc
+*.wlrc
+.DS_Store

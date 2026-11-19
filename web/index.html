@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>lrc-align: Word-by-Word Lyrics Aligner</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #161a22;
+    --surface-2: #1d222d;
+    --border: #2a3140;
+    --text: #eef1f7;
+    --muted: #9aa6bd;
+    --accent: #f9ab00;
+    --accent-2: #4da3ff;
+    --green: #3ddc97;
+    --red: #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.5;
+  }
+  button, select, input[type="checkbox"], summary {
+    cursor: pointer;
+  }
+  button:disabled, select:disabled, input:disabled {
+    cursor: not-allowed;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent-2);
+    outline-offset: 2px;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    background: #13161e;
+    padding: 12px 24px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand h1 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .hw-status {
+    font-size: 12px;
+    font-family: var(--mono);
+    padding: 3px 10px;
+    border-radius: 6px;
+    background: rgba(77, 163, 255, 0.12);
+    color: #8cc4ff;
+    border: 1px solid rgba(77, 163, 255, 0.35);
+  }
+  .hw-status.gpu {
+    background: rgba(61, 220, 151, 0.12);
+    color: #6ee7b7;
+    border-color: rgba(61, 220, 151, 0.35);
+  }
+  .privacy-note {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  main {
+    max-width: 980px;
+    margin: 24px auto 64px;
+    padding: 0 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .cell {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    display: grid;
+    grid-template-columns: 56px 1fr;
+    overflow: hidden;
+    transition: border-color 0.15s ease;
+  }
+  .cell.active { border-color: var(--accent-2); }
+  .gutter {
+    background: #13161d;
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 14px 6px;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .play-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+  .play-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .play-btn:disabled { opacity: 0.45; }
+  .cell-body { padding: 18px 20px; min-width: 0; }
+  .cell-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .cell-header h2 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .file-status {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    word-break: break-word;
+  }
+  .dropzone {
+    width: 100%;
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 26px 20px;
+    text-align: center;
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 15px;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .dropzone:hover { border-color: var(--accent-2); }
+  .dropzone.dragover {
+    border-color: var(--accent);
+    background: rgba(249, 171, 0, 0.08);
+  }
+  .dropzone strong { display: block; color: var(--text); font-weight: 600; }
+  .dropzone small { display: block; color: var(--muted); margin-top: 6px; font-size: 13px; }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .pill {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+  }
+  .field-label {
+    display: block;
+    margin-top: 14px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+  }
+  textarea {
+    width: 100%;
+    min-height: 150px;
+    margin-top: 6px;
+    background: #10131a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    resize: vertical;
+  }
+  .grid-opts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 14px;
+  }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  select, input[type="checkbox"] { accent-color: var(--accent); }
+  select {
+    min-height: 44px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+  .check-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    margin-top: 14px;
+    font-size: 13px;
+  }
+  .check-row label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+  }
+  .check-row input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+  }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+  button.btn {
+    min-height: 44px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 15px;
+    font-size: 13px;
+    font-weight: 500;
+    transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+  }
+  button.btn:hover:not(:disabled) { border-color: var(--accent-2); color: #8cc4ff; }
+  button.btn:active:not(:disabled) { transform: translateY(1px); }
+  button.btn.primary {
+    background: var(--accent);
+    color: #111318;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  button.btn.primary:hover:not(:disabled) { filter: brightness(1.06); color: #111318; }
+  button.btn.warn {
+    border-color: rgba(249, 171, 0, 0.55);
+    color: #ffd166;
+  }
+  button.btn.warn:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: rgba(249, 171, 0, 0.14);
+    color: #ffe39b;
+  }
+  button.btn:disabled { opacity: 0.45; }
+  .path-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .path-row input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    min-height: 44px;
+    background: #10131a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 8px 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .progress-wrap {
+    height: 7px;
+    background: #10131a;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: var(--accent-2);
+    transition: width 0.2s ease;
+  }
+  .error-banner {
+    display: none;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border-radius: 7px;
+    background: rgba(255, 107, 107, 0.12);
+    border: 1px solid rgba(255, 107, 107, 0.45);
+    color: #ffb3b3;
+    font-size: 13px;
+  }
+  .error-banner.visible { display: block; }
+  pre.logbox {
+    margin: 0;
+    background: #0b0d12;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    max-height: 220px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: #c5d0e3;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .karaoke-empty {
+    padding: 18px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .karaoke-stage {
+    background: #0d1017;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    max-height: 300px;
+    overflow-y: auto;
+    margin: 12px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .k-line-btn {
+    display: block;
+    width: 100%;
+    min-height: 44px;
+    padding: 8px 10px;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 17px;
+    font-weight: 500;
+    line-height: 1.5;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .k-line-btn:hover { background: rgba(255, 255, 255, 0.04); }
+  .k-line-btn.active {
+    background: rgba(77, 163, 255, 0.08);
+    border-color: rgba(77, 163, 255, 0.35);
+    font-size: 18px;
+  }
+  .k-word {
+    display: inline;
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    background-image: linear-gradient(90deg, #ffffff var(--p, 0%), rgba(232, 236, 244, 0.58) var(--p, 0%));
+  }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .tab {
+    min-height: 44px;
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: var(--mono);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .tab.active, .tab[aria-selected="true"] {
+    color: var(--text);
+    border-color: var(--accent-2);
+    background: rgba(77, 163, 255, 0.12);
+  }
+  audio { width: 100%; margin-top: 8px; }
+  @media (max-width: 640px) {
+    header { padding: 12px 14px; }
+    main { padding: 0 12px; margin-top: 14px; }
+    .cell { grid-template-columns: 1fr; }
+    .gutter {
+      flex-direction: row;
+      justify-content: space-between;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding: 8px 14px;
+    }
+    .cell-body { padding: 14px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition: none !important;
+      animation: none !important;
+      scroll-behavior: auto !important;
+    }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>lrc-align</h1>
+    <span class="hw-status" id="hwBadge">Checking runtime device...</span>
+  </div>
+  <span class="privacy-note">Localhost processing: audio stays on your machine</span>
+</header>
+
+<main>
+  <section class="cell" id="cell1" aria-labelledby="cell1-title">
+    <div class="gutter"><span>[1]</span></div>
+    <div class="cell-body">
+      <div class="cell-header">
+        <h2 id="cell1-title">1. Audio &amp; Lyrics Input</h2>
+        <span class="file-status" id="fileStatus">No file selected</span>
+      </div>
+
+      <button type="button" class="dropzone" id="dropzone">
+        <strong>Drag &amp; drop an audio file here, or click to browse</strong>
+        <small>Supports .m4a, .flac, .mp3, .wav, .ogg, and .lrc / .txt</small>
+      </button>
+      <input type="file" id="fileInput" accept="audio/*,.m4a,.flac,.mp3,.wav,.ogg,.lrc,.txt" multiple hidden />
+
+      <div class="meta-row" id="metaRow" style="display:none;"></div>
+
+      <div class="btn-row">
+        <button type="button" class="btn" id="lrclibBtn" disabled>Fetch from LRCLIB</button>
+        <button type="button" class="btn" id="clearLyricsBtn">Clear Lyrics</button>
+        <span id="lyricsHint" style="font-size:12px;color:var(--muted);">Drop an audio file to inspect embedded tags and lyrics.</span>
+      </div>
+
+      <label class="field-label" for="lyricsInput">Source lyrics</label>
+      <textarea id="lyricsInput" placeholder="Embedded lyrics load automatically when present. You can also drop a .lrc/.txt file, paste lyrics here, click Fetch from LRCLIB, or leave blank to transcribe with Whisper."></textarea>
+    </div>
+  </section>
+
+  <section class="cell" id="cell2" aria-labelledby="cell2-title">
+    <div class="gutter"><span>[2]</span></div>
+    <div class="cell-body">
+      <div class="cell-header">
+        <h2 id="cell2-title">2. Alignment Parameters</h2>
+      </div>
+      <div class="grid-opts">
+        <label class="field" for="modelSelect">
+          Whisper Model
+          <select id="modelSelect">
+            <option value="base">base · 290 MB</option>
+            <option value="small">small · 970 MB</option>
+            <option value="medium" selected>medium · 3.0 GB</option>
+            <option value="large-v3-turbo">large-v3-turbo · 1.6 GB</option>
+          </select>
+        </label>
+        <label class="field" for="langSelect">
+          Language
+          <select id="langSelect">
+            <option value="auto" selected>Auto-detect</option>
+            <option value="ja">Japanese</option>
+            <option value="en">English</option>
+            <option value="id">Indonesian</option>
+            <option value="ko">Korean</option>
+            <option value="zh">Chinese</option>
+          </select>
+        </label>
+      </div>
+      <div class="check-row">
+        <label for="vocalIsoCheck"><input type="checkbox" id="vocalIsoCheck" checked /> Center-vocal STFT isolation</label>
+        <label for="pauseSnapCheck"><input type="checkbox" id="pauseSnapCheck" checked /> Vocal-envelope pause snapping</label>
+        <label for="gpuCheck"><input type="checkbox" id="gpuCheck" checked /> Prefer GPU acceleration</label>
+        <label for="replaceOrigCheck"><input type="checkbox" id="replaceOrigCheck" /> Overwrite original audio file</label>
+        <label for="writeSidecarLrcCheck"><input type="checkbox" id="writeSidecarLrcCheck" /> Also write/replace .lrc next to original</label>
+      </div>
+      <div id="targetPathWrap" style="margin-top:8px;">
+        <label class="field-label" for="targetPathInput">Original file path</label>
+        <div class="path-row">
+          <input type="text" id="targetPathInput" placeholder="/path/to/original/song.m4a" />
+          <button type="button" class="btn" id="locateBtn">Find Match</button>
+        </div>
+        <div id="locateHint" style="font-size:12px;color:var(--muted);margin-top:6px;">Auto-matches exact filename and byte size when an audio file is selected.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="cell" id="cell3" aria-labelledby="cell3-title">
+    <div class="gutter">
+      <button type="button" class="play-btn" id="runBtn" aria-label="Run alignment" disabled>&#9654;</button>
+      <span id="runState">[3]</span>
+    </div>
+    <div class="cell-body">
+      <div class="cell-header">
+        <h2 id="cell3-title">3. Run Alignment</h2>
+        <button type="button" class="btn primary" id="runBtnText" disabled>Run Alignment</button>
+      </div>
+      <div class="progress-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressWrap">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="error-banner" id="errorBanner" role="alert"></div>
+      <pre class="logbox" id="logBox">Ready. Drop an audio file in Cell [1] and press Run Alignment.</pre>
+    </div>
+  </section>
+
+  <section class="cell" id="cell4" aria-labelledby="cell4-title">
+    <div class="gutter"><span>[4]</span></div>
+    <div class="cell-body">
+      <div class="cell-header">
+        <h2 id="cell4-title">4. Result &amp; Live Karaoke Preview</h2>
+        <span id="resultSummary" style="font-family:var(--mono);font-size:12px;color:var(--green);"></span>
+      </div>
+
+      <div class="karaoke-empty" id="emptyResult">
+        No alignment output yet. Run Cell [3] to generate word-level Enhanced LRC and WLRC, then preview playback here.
+      </div>
+
+      <div id="resultPanel" style="display:none;">
+        <audio id="audioPlayer" controls></audio>
+        <div class="karaoke-stage" id="karaokeStage"></div>
+
+        <div class="btn-row">
+          <button type="button" class="btn primary" id="dlLrcBtn">Download .lrc</button>
+          <button type="button" class="btn" id="dlWlrcBtn">Download .wlrc</button>
+          <button type="button" class="btn" id="dlEmbedBtn">Download Audio</button>
+          <button type="button" class="btn warn" id="replaceOrigBtn">Overwrite Original File</button>
+          <button type="button" class="btn" id="copyBtn">Copy Output</button>
+        </div>
+        <div id="replaceStatus" role="status" style="font-size:12px;color:var(--green);margin-top:8px;"></div>
+
+        <div class="tabs" role="tablist" aria-label="Lyrics output format">
+          <button type="button" class="tab active" role="tab" aria-selected="true" data-fmt="lrc">Enhanced LRC</button>
+          <button type="button" class="tab" role="tab" aria-selected="false" data-fmt="wlrc">WLRC</button>
+        </div>
+        <label class="field-label" for="outputBox">Generated lyrics</label>
+        <textarea id="outputBox" readonly style="min-height:220px;"></textarea>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let selectedAudioFile = null;
+let selectedFileHandle = null;
+let lastMeta = null;
+let currentJobId = null;
+let lastOutput = null;
+let activeFmt = 'lrc';
+let audioUrl = null;
+let previewFallbackApplied = false;
+let karaokeNodes = [];
+let activeSource = null;
+
+fetch('/api/capabilities').then(r => r.json()).then(c => {
+  const b = $('hwBadge');
+  if (c.gpu_ready) {
+    b.textContent = c.device;
+    b.classList.add('gpu');
+  } else if (c.cuda_compiled) {
+    b.textContent = 'CUDA Compiled (CPU fallback)';
+  } else if (c.metal_compiled) {
+    b.textContent = 'Metal Compiled (CPU fallback)';
+  } else {
+    b.textContent = 'CPU Mode';
+  }
+}).catch(() => {
+  $('hwBadge').textContent = 'Device check failed';
+});
+
+const dz = $('dropzone');
+const fi = $('fileInput');
+dz.addEventListener('click', () => fi.click());
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', async e => {
+  e.preventDefault();
+  dz.classList.remove('dragover');
+  selectedFileHandle = null;
+  if (e.dataTransfer.items) {
+    for (const item of e.dataTransfer.items) {
+      if (item.kind === 'file' && typeof item.getAsFileSystemHandle === 'function') {
+        try {
+          const handle = await item.getAsFileSystemHandle();
+          if (handle && handle.kind === 'file' && !/\.(lrc|txt|wlrc)$/i.test(handle.name)) {
+            selectedFileHandle = handle;
+          }
+        } catch {}
+      }
+    }
+  }
+  handleFiles(e.dataTransfer.files);
+});
+fi.addEventListener('change', e => handleFiles(e.target.files));
+
+async function handleFiles(files) {
+  for (const f of files) {
+    const ext = f.name.split('.').pop().toLowerCase();
+    if (ext === 'lrc' || ext === 'txt' || ext === 'wlrc') {
+      $('lyricsInput').value = await f.text();
+      $('lyricsHint').textContent = `Loaded lyrics from ${f.name}`;
+    } else {
+      await loadAudioFile(f);
+    }
+  }
+}
+
+async function locateOriginal(file) {
+  if (!file) return;
+  $('locateHint').textContent = 'Searching local folders for original file...';
+  $('locateHint').style.color = 'var(--muted)';
+  try {
+    const res = await fetch('/api/locate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: file.name, size: file.size }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const matches = data.matches || [];
+    if (matches.length === 1) {
+      $('targetPathInput').value = matches[0];
+      $('locateHint').textContent = `Exact match found: ${matches[0]}`;
+      $('locateHint').style.color = 'var(--green)';
+    } else if (matches.length > 1) {
+      $('targetPathInput').value = matches[0];
+      $('locateHint').textContent = `Found ${matches.length} matching copies; selected first (${matches[0]}). Verify path before overwriting.`;
+      $('locateHint').style.color = 'var(--accent)';
+    } else {
+      $('targetPathInput').value = '';
+      $('locateHint').textContent = 'No automatic match found in standard folders. Paste the full path above if you want to overwrite in-place.';
+      $('locateHint').style.color = 'var(--muted)';
+    }
+  } catch (err) {
+    $('locateHint').textContent = `Path lookup failed: ${err.message}`;
+  }
+}
+
+async function loadAudioFile(file) {
+  selectedAudioFile = file;
+  previewFallbackApplied = false;
+  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  audioUrl = URL.createObjectURL(file);
+  $('audioPlayer').src = audioUrl;
+
+  $('fileStatus').textContent = `${file.name} (${(file.size / 1048576).toFixed(1)} MB)`;
+  $('runBtn').disabled = false;
+  $('runBtnText').disabled = false;
+  $('lrclibBtn').disabled = false;
+  $('errorBanner').classList.remove('visible');
+  $('replaceStatus').textContent = '';
+  locateOriginal(file);
+
+  const fd = new FormData();
+  fd.append('audio', file);
+  try {
+    const res = await fetch('/api/inspect', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    lastMeta = data.metadata;
+    const m = data.metadata;
+    const pills = [
+      m.title ? `title: ${m.title}` : null,
+      m.artist ? `artist: ${m.artist}` : null,
+      m.album ? `album: ${m.album}` : null,
+      m.duration_secs ? `duration: ${m.duration_secs.toFixed(1)}s` : null,
+      m.sample_rate ? `${m.sample_rate} Hz` : null,
+    ].filter(Boolean);
+    $('metaRow').innerHTML = pills.map(p => `<span class="pill">${esc(p)}</span>`).join('');
+    $('metaRow').style.display = pills.length ? 'flex' : 'none';
+    if (m.lyrics && !$('lyricsInput').value.trim()) {
+      $('lyricsInput').value = m.lyrics;
+      $('lyricsHint').textContent = 'Loaded embedded lyrics from audio tags.';
+    } else if (!m.lyrics) {
+      $('lyricsHint').textContent = 'No embedded lyrics found. Paste lyrics, fetch from LRCLIB, or leave blank to auto-transcribe.';
+    }
+  } catch (err) {
+    $('lyricsHint').textContent = 'Could not read metadata tags. Audio decoding will still run.';
+  }
+}
+
+$('lrclibBtn').addEventListener('click', async () => {
+  const title = lastMeta?.title || selectedAudioFile?.name.replace(/\.[^.]+$/, '') || '';
+  if (!title) return;
+  $('lrclibBtn').disabled = true;
+  $('lyricsHint').textContent = 'Querying LRCLIB...';
+  try {
+    const res = await fetch('/api/lrclib', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title,
+        artist: lastMeta?.artist || null,
+        album: lastMeta?.album || null,
+        duration_secs: lastMeta?.duration_secs || null,
+      })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    $('lyricsInput').value = data.lyrics;
+    $('lyricsHint').textContent = `Fetched from ${data.source}.`;
+  } catch (e) {
+    $('lyricsHint').textContent = `LRCLIB lookup failed: ${e.message}`;
+  } finally {
+    $('lrclibBtn').disabled = false;
+  }
+});
+
+$('clearLyricsBtn').addEventListener('click', () => {
+  $('lyricsInput').value = '';
+  $('lyricsHint').textContent = 'Cleared: Whisper will auto-transcribe the audio.';
+});
+
+function setRunning(running) {
+  $('runBtn').disabled = running || !selectedAudioFile;
+  $('runBtnText').disabled = running || !selectedAudioFile;
+  $('runBtnText').textContent = running ? 'Aligning...' : 'Run Alignment';
+  $('cell3').classList.toggle('active', running);
+}
+
+function showError(msg, prefix = 'Alignment failed') {
+  const banner = $('errorBanner');
+  banner.textContent = `${prefix}: ${msg}`;
+  banner.classList.add('visible');
+}
+
+function ensurePlayablePreview(seekAndPlayTime = null) {
+  const player = $('audioPlayer');
+  if (!currentJobId) return false;
+  const broken = Boolean(player.error) || !Number.isFinite(player.duration) || player.readyState === 0;
+  if (!previewFallbackApplied && broken) {
+    previewFallbackApplied = true;
+    if (seekAndPlayTime !== null) {
+      const onReady = () => {
+        player.currentTime = seekAndPlayTime;
+        player.play().catch(() => {});
+      };
+      player.addEventListener('loadedmetadata', onReady, { once: true });
+    }
+    player.src = `/api/jobs/${currentJobId}/preview.wav`;
+    player.load();
+    return true;
+  }
+  return false;
+}
+
+$('audioPlayer').addEventListener('error', () => {
+  ensurePlayablePreview();
+});
+
+async function startRun() {
+  if (!selectedAudioFile) return;
+  if (activeSource) {
+    activeSource.close();
+    activeSource = null;
+  }
+  $('errorBanner').classList.remove('visible');
+  setRunning(true);
+  $('progressBar').style.width = '2%';
+  $('progressWrap').setAttribute('aria-valuenow', '2');
+  $('logBox').textContent = '[start] Uploading audio and queuing alignment job...\n';
+
+  const fd = new FormData();
+  fd.append('audio', selectedAudioFile);
+  fd.append('lyrics', $('lyricsInput').value);
+  fd.append('model', $('modelSelect').value);
+  fd.append('language', $('langSelect').value);
+  fd.append('vocal_isolation', $('vocalIsoCheck').checked ? 'true' : 'false');
+  fd.append('pause_snapping', $('pauseSnapCheck').checked ? 'true' : 'false');
+  fd.append('prefer_gpu', $('gpuCheck').checked ? 'true' : 'false');
+
+  try {
+    const res = await fetch('/api/align', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    const { job_id } = await res.json();
+    currentJobId = job_id;
+
+    activeSource = new EventSource(`/api/jobs/${job_id}/events`);
+    activeSource.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      if (ev.type === 'log') {
+        const pct = Math.round(ev.progress * 100);
+        $('progressBar').style.width = `${pct}%`;
+        $('progressWrap').setAttribute('aria-valuenow', String(pct));
+        $('logBox').textContent += `${ev.message}\n`;
+        $('logBox').scrollTop = $('logBox').scrollHeight;
+      } else if (ev.type === 'done') {
+        activeSource.close();
+        activeSource = null;
+        $('progressBar').style.width = '100%';
+        $('progressWrap').setAttribute('aria-valuenow', '100');
+        setRunning(false);
+        showResult(ev.output);
+      } else if (ev.type === 'error') {
+        activeSource.close();
+        activeSource = null;
+        setRunning(false);
+        showError(ev.message);
+        $('logBox').textContent += `\n[ERROR] ${ev.message}\n`;
+      }
+    };
+    activeSource.onerror = () => {
+      if (activeSource) {
+        activeSource.close();
+        activeSource = null;
+        setRunning(false);
+        showError('Lost connection to local server stream');
+      }
+    };
+  } catch (err) {
+    setRunning(false);
+    showError(err.message);
+  }
+}
+
+$('runBtn').addEventListener('click', startRun);
+$('runBtnText').addEventListener('click', startRun);
+
+function showResult(out) {
+  lastOutput = out;
+  $('emptyResult').style.display = 'none';
+  $('resultPanel').style.display = 'block';
+  $('resultSummary').textContent = `${out.lines.length} lines | ${out.language} | ${out.device_used} | ${out.elapsed_secs.toFixed(1)}s`;
+  ensurePlayablePreview();
+  renderOutputText();
+  buildKaraoke(out.lines);
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  $('cell4').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'nearest' });
+  if ($('replaceOrigCheck').checked) {
+    performReplaceOriginal(true);
+  }
+}
+
+async function performReplaceOriginal(isAuto = false) {
+  if (!currentJobId) return;
+  const targetPath = $('targetPathInput').value.trim();
+  const writeSidecar = $('writeSidecarLrcCheck').checked;
+  const btn = $('replaceOrigBtn');
+  btn.disabled = true;
+  $('errorBanner').classList.remove('visible');
+  $('replaceStatus').textContent = 'Replacing original file...';
+  $('replaceStatus').style.color = 'var(--muted)';
+  try {
+    if (targetPath) {
+      const res = await fetch(`/api/jobs/${currentJobId}/replace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_path: targetPath, write_sidecar_lrc: writeSidecar }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      const lrcNote = data.sidecar_lrc ? ` + ${data.sidecar_lrc}` : '';
+      const msg = `Replaced original file -> ${data.replaced_path}${lrcNote}`;
+      $('replaceStatus').textContent = msg;
+      $('replaceStatus').style.color = 'var(--green)';
+      $('logBox').textContent += `[replace] ${msg}\n`;
+      $('logBox').scrollTop = $('logBox').scrollHeight;
+    } else if (selectedFileHandle && typeof selectedFileHandle.createWritable === 'function') {
+      if (typeof selectedFileHandle.requestPermission === 'function') {
+        const perm = await selectedFileHandle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') throw new Error('Write permission denied by browser');
+      }
+      const res = await fetch(`/api/jobs/${currentJobId}/download/embedded`);
+      if (!res.ok) throw new Error(await res.text());
+      const writable = await selectedFileHandle.createWritable();
+      await writable.write(await res.blob());
+      await writable.close();
+      const msg = `Replaced original file via browser handle -> ${selectedFileHandle.name}`;
+      $('replaceStatus').textContent = msg;
+      $('replaceStatus').style.color = 'var(--green)';
+      $('logBox').textContent += `[replace] ${msg}\n`;
+    } else {
+      throw new Error('Set or locate the original file path in Cell [2] before overwriting');
+    }
+  } catch (err) {
+    $('replaceStatus').textContent = '';
+    showError(isAuto ? `skipped (${err.message})` : err.message, 'File overwrite failed');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('locateBtn').addEventListener('click', () => locateOriginal(selectedAudioFile));
+$('replaceOrigBtn').addEventListener('click', () => performReplaceOriginal(false));
+
+function renderOutputText() {
+  if (!lastOutput) return;
+  $('outputBox').value = activeFmt === 'lrc' ? lastOutput.enhanced_lrc : lastOutput.wlrc;
+}
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => {
+      t.classList.remove('active');
+      t.setAttribute('aria-selected', 'false');
+    });
+    tab.classList.add('active');
+    tab.setAttribute('aria-selected', 'true');
+    activeFmt = tab.dataset.fmt;
+    renderOutputText();
+  });
+});
+
+$('copyBtn').addEventListener('click', async () => {
+  await navigator.clipboard.writeText($('outputBox').value);
+  $('copyBtn').textContent = 'Copied';
+  setTimeout(() => $('copyBtn').textContent = 'Copy Output', 1500);
+});
+
+$('dlLrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/lrc`; });
+$('dlWlrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/wlrc`; });
+$('dlEmbedBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/embedded`; });
+
+function buildKaraoke(lines) {
+  const stage = $('karaokeStage');
+  stage.innerHTML = '';
+  karaokeNodes = lines.map(line => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'k-line-btn';
+    btn.setAttribute('aria-label', `Seek to ${line.text}`);
+    const wordEls = line.words.map(w => {
+      const span = document.createElement('span');
+      span.className = 'k-word';
+      span.textContent = w.text;
+      btn.appendChild(span);
+      return { el: span, start: w.start, end: w.end };
+    });
+    btn.addEventListener('click', () => {
+      if (!ensurePlayablePreview(line.start)) {
+        $('audioPlayer').currentTime = line.start;
+        $('audioPlayer').play().catch(() => {});
+      }
+    });
+    stage.appendChild(btn);
+    return { btn, start: line.start, end: line.end, words: wordEls };
+  });
+}
+
+function updateKaraoke() {
+  const t = $('audioPlayer').currentTime;
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let activeNode = null;
+  for (const node of karaokeNodes) {
+    const isLineActive = t >= node.start && t <= node.end + 0.35;
+    node.btn.classList.toggle('active', isLineActive);
+    if (isLineActive && !activeNode) activeNode = node;
+    for (const w of node.words) {
+      let pct = 0;
+      if (t >= w.end) pct = 100;
+      else if (t > w.start) pct = ((t - w.start) / Math.max(0.02, w.end - w.start)) * 100;
+      w.el.style.setProperty('--p', `${pct.toFixed(1)}%`);
+    }
+  }
+  if (activeNode && !$('audioPlayer').paused) {
+    activeNode.btn.scrollIntoView({ block: 'nearest', behavior: reduced ? 'auto' : 'smooth' });
+  }
+  requestAnimationFrame(updateKaraoke);
+}
+requestAnimationFrame(updateKaraoke);
+
+function esc(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+</body>
+</html>
