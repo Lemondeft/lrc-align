@@ -2,19 +2,21 @@ use crate::audio::{
     atomic_write_bytes, embed_lyrics_in_place, embed_lyrics_to_file, inspect_metadata,
     write_preview_wav,
 };
+use crate::doctor;
 use crate::lrclib::fetch_from_lrclib;
 use crate::pipeline::{AlignOptions, AlignOutput, ModelCache, run_alignment_pipeline};
-use crate::whisper_align::WhisperSize;
+use crate::segmenter::{format_enhanced_lrc, format_wlrc, shift_aligned_lines};
+use crate::whisper_align::{DevicePreference, WhisperSize, list_cached_models, select_device_checked};
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,7 +32,9 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 struct AppState {
     model_cache: Arc<ModelCache>,
     jobs: Arc<Mutex<HashMap<String, Arc<JobRecord>>>>,
+    job_order: Arc<Mutex<VecDeque<String>>>,
     temp_root: Arc<TempDir>,
+    default_force_gpu: bool,
 }
 
 struct JobRecord {
@@ -61,6 +65,14 @@ struct ReplaceRequest {
     target_path: String,
     #[serde(default)]
     write_sidecar_lrc: bool,
+    #[serde(default)]
+    offset_ms: f64,
+}
+
+#[derive(Deserialize)]
+struct DownloadQuery {
+    #[serde(default)]
+    offset_ms: f64,
 }
 
 #[derive(Deserialize)]
@@ -71,17 +83,24 @@ struct LrcLibRequest {
     duration_secs: Option<f64>,
 }
 
-pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
+pub async fn serve(port: u16, open_browser: bool, force_gpu: bool) -> Result<()> {
+    if force_gpu {
+        let (_, label) = select_device_checked(DevicePreference::ForceGpu)?;
+        println!("GPU verified (--force-gpu): {label}");
+    }
     let temp_root = Arc::new(tempfile::tempdir()?);
     let state = AppState {
         model_cache: ModelCache::new(),
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        job_order: Arc::new(Mutex::new(VecDeque::new())),
         temp_root,
+        default_force_gpu: force_gpu,
     };
 
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/api/capabilities", get(capabilities_handler))
+        .route("/api/doctor", get(doctor_handler))
         .route("/api/inspect", post(inspect_handler))
         .route("/api/locate", post(locate_handler))
         .route("/api/lrclib", post(lrclib_handler))
@@ -125,17 +144,24 @@ async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn capabilities_handler() -> Json<serde_json::Value> {
+async fn capabilities_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cuda_compiled = cfg!(feature = "cuda");
     let metal_compiled = cfg!(feature = "metal");
     let (_, active_device) = crate::whisper_align::select_device(true);
     let gpu_ready = active_device != "CPU";
+    let cached_models = list_cached_models();
     Json(serde_json::json!({
         "cuda_compiled": cuda_compiled,
         "metal_compiled": metal_compiled,
         "gpu_ready": gpu_ready,
         "device": active_device,
+        "cached_models": cached_models,
+        "default_device_mode": if state.default_force_gpu { "force-gpu" } else { "auto" },
     }))
+}
+
+async fn doctor_handler() -> Json<doctor::DoctorReport> {
+    Json(doctor::run_doctor(true).await)
 }
 
 async fn inspect_handler(
@@ -210,7 +236,11 @@ async fn align_handler(
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut lyrics_text: Option<String> = None;
     let mut model = String::from("medium");
-    let mut prefer_gpu = true;
+    let mut device_mode = if state.default_force_gpu {
+        String::from("force-gpu")
+    } else {
+        String::from("auto")
+    };
     let mut vocal_isolation = true;
     let mut pause_snapping = true;
     let mut language = String::from("auto");
@@ -244,8 +274,18 @@ async fn align_handler(
             Some("model") => {
                 model = field.text().await.unwrap_or(model);
             }
+            Some("device_mode") => {
+                device_mode = field.text().await.unwrap_or(device_mode);
+            }
+            Some("force_gpu") => {
+                if field.text().await.unwrap_or_default() == "true" {
+                    device_mode = String::from("force-gpu");
+                }
+            }
             Some("prefer_gpu") => {
-                prefer_gpu = field.text().await.unwrap_or_default() != "false";
+                if field.text().await.unwrap_or_default() == "false" {
+                    device_mode = String::from("cpu");
+                }
             }
             Some("vocal_isolation") => {
                 vocal_isolation = field.text().await.unwrap_or_default() != "false";
@@ -282,14 +322,16 @@ async fn align_handler(
         preview_lock: tokio::sync::Mutex::new(()),
     });
     state.jobs.lock().unwrap().insert(job_id.clone(), record.clone());
+    evict_old_jobs(&state, &job_id);
 
     let opts = AlignOptions {
         model_size: WhisperSize::from_str_name(&model),
-        prefer_gpu,
+        device_pref: DevicePreference::from_str_name(&device_mode),
         vocal_isolation,
         pause_snapping,
         language: if language == "auto" { None } else { Some(language) },
         raw_lyrics_override: lyrics_text,
+        offset_ms: 0.0,
     };
 
     let cache = state.model_cache.clone();
@@ -361,6 +403,7 @@ async fn job_events_handler(
 async fn download_handler(
     State(state): State<AppState>,
     AxumPath((id, kind)): AxumPath<(String, String)>,
+    Query(query): Query<DownloadQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let record = state
         .jobs
@@ -382,11 +425,13 @@ async fn download_handler(
         .and_then(|s| s.to_str())
         .unwrap_or("lyrics");
 
+    let (lrc_text, wlrc_text) = format_output_with_offset(&output, query.offset_ms);
+
     match kind.as_str() {
         "lrc" => {
             let fname = format!("{stem}.lrc");
             Ok(download_response(
-                output.enhanced_lrc.into_bytes(),
+                lrc_text.into_bytes(),
                 "text/plain; charset=utf-8",
                 &fname,
             ))
@@ -394,7 +439,7 @@ async fn download_handler(
         "wlrc" => {
             let fname = format!("{stem}.wlrc");
             Ok(download_response(
-                output.wlrc.into_bytes(),
+                wlrc_text.into_bytes(),
                 "text/plain; charset=utf-8",
                 &fname,
             ))
@@ -405,8 +450,7 @@ async fn download_handler(
                 .parent()
                 .unwrap()
                 .join(format!("embedded_{}", record.audio_filename));
-            let lrc = output.enhanced_lrc.clone();
-            tokio::task::spawn_blocking(move || embed_lyrics_to_file(&src, &dst, &lrc).map(|_| dst))
+            tokio::task::spawn_blocking(move || embed_lyrics_to_file(&src, &dst, &lrc_text).map(|_| dst))
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
                 .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("Embed failed: {e}")))
@@ -421,6 +465,48 @@ async fn download_handler(
                 })
         }
         _ => Err((StatusCode::BAD_REQUEST, "Unknown download kind".into())),
+    }
+}
+
+fn format_output_with_offset(output: &AlignOutput, offset_ms: f64) -> (String, String) {
+    if offset_ms.abs() < 0.01 {
+        return (output.enhanced_lrc.clone(), output.wlrc.clone());
+    }
+    let shifted = shift_aligned_lines(&output.lines, offset_ms);
+    let elrc = format_enhanced_lrc(
+        &shifted,
+        output.metadata.title.as_deref(),
+        output.metadata.artist.as_deref(),
+        output.metadata.album.as_deref(),
+    );
+    let wlrc = format_wlrc(
+        &shifted,
+        output.metadata.title.as_deref(),
+        output.metadata.artist.as_deref(),
+        output.metadata.album.as_deref(),
+    );
+    (elrc, wlrc)
+}
+
+fn evict_old_jobs(state: &AppState, new_job_id: &str) {
+    const MAX_RETAINED_JOBS: usize = 5;
+    let mut order = state.job_order.lock().unwrap();
+    order.push_back(new_job_id.to_string());
+    let mut expired = Vec::new();
+    while order.len() > MAX_RETAINED_JOBS {
+        if let Some(old_id) = order.pop_front() {
+            expired.push(old_id);
+        }
+    }
+    drop(order);
+
+    for old_id in expired {
+        let removed = state.jobs.lock().unwrap().remove(&old_id);
+        if let Some(rec) = removed {
+            if let Some(dir) = rec.audio_path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 }
 
@@ -489,7 +575,7 @@ async fn replace_handler(
     }
 
     let write_sidecar = req.write_sidecar_lrc;
-    let lrc_text = output.enhanced_lrc.clone();
+    let (lrc_text, _) = format_output_with_offset(&output, req.offset_ms);
     let target_clone = target_path.clone();
 
     let sidecar_written = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {

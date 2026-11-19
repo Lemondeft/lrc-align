@@ -304,6 +304,48 @@ pub fn format_wlrc(
     out.join("\n") + "\n"
 }
 
+/// Shift all line and word timestamps by `offset_ms`, clamping at 0.0 and preserving monotonicity.
+pub fn shift_aligned_lines(lines: &[AlignedLine], offset_ms: f64) -> Vec<AlignedLine> {
+    if offset_ms.abs() < 0.01 {
+        return lines.to_vec();
+    }
+    let dt = offset_ms / 1000.0;
+    lines
+        .iter()
+        .map(|line| {
+            let mut cursor = 0.0_f64;
+            let words: Vec<WordSpan> = line
+                .words
+                .iter()
+                .map(|w| {
+                    let s = (w.start + dt).max(cursor);
+                    let e = (w.end + dt).max(s + 0.02);
+                    cursor = e;
+                    WordSpan {
+                        text: w.text.clone(),
+                        start: s,
+                        end: e,
+                    }
+                })
+                .collect();
+            let start = words
+                .first()
+                .map(|w| w.start)
+                .unwrap_or((line.start + dt).max(0.0));
+            let end = words
+                .last()
+                .map(|w| w.end)
+                .unwrap_or((line.end + dt).max(start + 0.02));
+            AlignedLine {
+                start,
+                end,
+                text: line.text.clone(),
+                words,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +394,31 @@ mod tests {
         assert!(elrc.contains("[00:02.13]<00:02.13>言って<00:02.77>"));
         let wlrc = format_wlrc(&lines, None, None, None);
         assert_eq!(wlrc.trim(), "[00:02.13]言って");
+    }
+
+    #[test]
+    fn shift_aligned_lines_clamps_to_zero_and_keeps_order() {
+        let lines = vec![AlignedLine {
+            start: 0.10,
+            end: 0.60,
+            text: "Hi there".into(),
+            words: vec![
+                WordSpan {
+                    text: "Hi ".into(),
+                    start: 0.10,
+                    end: 0.25,
+                },
+                WordSpan {
+                    text: "there".into(),
+                    start: 0.25,
+                    end: 0.60,
+                },
+            ],
+        }];
+        let shifted = shift_aligned_lines(&lines, -200.0);
+        assert!((shifted[0].words[0].start - 0.0).abs() < 1e-6);
+        assert!((shifted[0].words[0].end - 0.05).abs() < 1e-6);
+        assert!((shifted[0].words[1].start - 0.05).abs() < 1e-6);
+        assert!((shifted[0].words[1].end - 0.40).abs() < 1e-6);
     }
 }

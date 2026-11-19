@@ -58,14 +58,25 @@ Models (`openai/whisper-{base,small,medium,large-v3-turbo}`) download automatica
 ## CLI Usage
 
 ```bash
-# Align audio using embedded lyrics (or auto-transcribe if none)
-lrc-align align song.m4a --model base
+# Verify GPU compute kernel, embedded dependencies, cached models, and connectivity
+lrc-align doctor
+lrc-align doctor --require-gpu
 
-# Specify external lyrics, Enhanced LRC output, and WLRC output
-lrc-align align song.m4a --lyrics lyrics.txt --output song.lrc --wlrc song.wlrc --model small
+# Self-update from GitHub, rebuild with current GPU features, and reinstall
+lrc-align -U
+lrc-align -U --force-gpu
+
+# Launch localhost Web UI and fail fast if GPU is unavailable
+lrc-align --force-gpu
+
+# Align audio using embedded lyrics (or auto-transcribe if none)
+lrc-align align song.m4a --model base --force-gpu
+
+# Specify external lyrics, Enhanced LRC output, WLRC output, and timing offset
+lrc-align align song.m4a --lyrics lyrics.txt --output song.lrc --wlrc song.wlrc --offset-ms -40
 
 # Embed aligned Enhanced LRC directly into the original audio file in-place
-lrc-align align song.m4a --model base --in-place
+lrc-align align song.m4a --model medium --in-place
 
 # Force CPU execution even on a CUDA build
 lrc-align align song.m4a --model base --cpu

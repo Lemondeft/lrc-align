@@ -5,6 +5,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self as cw, Config};
 use hf_hub::HFClient;
 use hf_hub::progress::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
+use realfft::RealFftPlanner;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -78,24 +79,201 @@ pub struct WhisperAligner {
     mel_filters: Vec<f32>,
     alignment_heads: Vec<(usize, usize)>,
     device: Device,
+    dtype: DType,
     sot_token: u32,
     transcribe_token: u32,
     no_timestamps_token: u32,
     eot_token: u32,
 }
 
-pub fn select_device(prefer_gpu: bool) -> (Device, String) {
-    if prefer_gpu {
-        #[cfg(feature = "cuda")]
-        if let Ok(dev) = Device::new_cuda(0) {
-            return (dev, "CUDA GPU (device 0)".to_string());
-        }
-        #[cfg(feature = "metal")]
-        if let Ok(dev) = Device::new_metal(0) {
-            return (dev, "Apple Metal GPU (device 0)".to_string());
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DevicePreference {
+    Auto,
+    ForceGpu,
+    Cpu,
+}
+
+impl DevicePreference {
+    pub fn from_str_name(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "force-gpu" | "force_gpu" | "gpu" | "cuda" | "metal" => Self::ForceGpu,
+            "cpu" => Self::Cpu,
+            _ => Self::Auto,
         }
     }
-    (Device::Cpu, "CPU".to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CachedModelInfo {
+    pub name: &'static str,
+    pub repo: String,
+    pub status: &'static str,
+    pub size_mb: f64,
+}
+
+pub fn hf_hub_dir() -> Option<PathBuf> {
+    std::env::var_os("HF_HOME")
+        .map(|p| PathBuf::from(p).join("hub"))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|p| PathBuf::from(p).join(".cache/huggingface/hub"))
+        })
+}
+
+/// Inspect all supported Whisper models in the local Hugging Face cache.
+pub fn inspect_cached_models() -> Vec<CachedModelInfo> {
+    let hub_dir = hf_hub_dir();
+    let all = [
+        ("tiny", WhisperSize::Tiny),
+        ("base", WhisperSize::Base),
+        ("small", WhisperSize::Small),
+        ("medium", WhisperSize::Medium),
+        ("large-v3-turbo", WhisperSize::LargeV3Turbo),
+    ];
+
+    let mut out = Vec::with_capacity(all.len());
+    for (name, size) in all {
+        let (owner, repo_name) = size.repo();
+        let repo = format!("{owner}/{repo_name}");
+        let Some(ref hub) = hub_dir else {
+            out.push(CachedModelInfo {
+                name,
+                repo,
+                status: "not_downloaded",
+                size_mb: 0.0,
+            });
+            continue;
+        };
+
+        let model_dir = hub.join(format!("models--{owner}--{repo_name}"));
+        let snap_dir = model_dir.join("snapshots");
+        let complete_bytes: u64 = std::fs::read_dir(&snap_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::metadata(e.path().join("model.safetensors")).ok())
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0);
+
+        if complete_bytes > 1_000_000 {
+            out.push(CachedModelInfo {
+                name,
+                repo,
+                status: "cached",
+                size_mb: complete_bytes as f64 / (1024.0 * 1024.0),
+            });
+            continue;
+        }
+
+        let blobs_dir = model_dir.join("blobs");
+        let incomplete_bytes: u64 = std::fs::read_dir(&blobs_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".incomplete"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+
+        if incomplete_bytes > 0 {
+            out.push(CachedModelInfo {
+                name,
+                repo,
+                status: "incomplete",
+                size_mb: incomplete_bytes as f64 / (1024.0 * 1024.0),
+            });
+        } else {
+            out.push(CachedModelInfo {
+                name,
+                repo,
+                status: "not_downloaded",
+                size_mb: 0.0,
+            });
+        }
+    }
+    out
+}
+
+/// Scan the local Hugging Face cache and return Whisper model names whose `model.safetensors` is complete.
+pub fn list_cached_models() -> Vec<&'static str> {
+    inspect_cached_models()
+        .into_iter()
+        .filter(|m| m.status == "cached")
+        .map(|m| m.name)
+        .collect()
+}
+
+/// Verify that tensor allocation and matrix multiplication actually work on `device`.
+pub fn gpu_smoke_test(device: &Device) -> Result<()> {
+    let dtype = if device.is_cuda() { DType::F16 } else { DType::F32 };
+    let a = Tensor::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], (2, 2), device)?.to_dtype(dtype)?;
+    let b = Tensor::from_slice(&[5.0_f32, 6.0, 7.0, 8.0], (2, 2), device)?.to_dtype(dtype)?;
+    let c = a.matmul(&b)?.to_dtype(DType::F32)?;
+    let vals: Vec<f32> = c.flatten_all()?.to_vec1()?;
+    let expected = [19.0_f32, 22.0, 43.0, 50.0];
+    for (got, want) in vals.iter().zip(expected.iter()) {
+        if (got - want).abs() > 0.1 {
+            return Err(anyhow!(
+                "GPU compute verification mismatch: got {got}, expected {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn select_device_checked(pref: DevicePreference) -> Result<(Device, String)> {
+    if pref == DevicePreference::Cpu {
+        return Ok((Device::Cpu, "CPU".to_string()));
+    }
+
+    #[allow(unused_assignments)]
+    let mut last_err: Option<String> = None;
+
+    #[cfg(feature = "cuda")]
+    {
+        match Device::new_cuda(0) {
+            Ok(dev) => match gpu_smoke_test(&dev) {
+                Ok(()) => return Ok((dev, "CUDA GPU (device 0)".to_string())),
+                Err(e) => last_err = Some(format!("CUDA compute kernel test failed: {e}")),
+            },
+            Err(e) => last_err = Some(format!("CUDA device 0 unavailable: {e}")),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    {
+        match Device::new_metal(0) {
+            Ok(dev) => match gpu_smoke_test(&dev) {
+                Ok(()) => return Ok((dev, "Apple Metal GPU (device 0)".to_string())),
+                Err(e) => last_err = Some(format!("Metal compute kernel test failed: {e}")),
+            },
+            Err(e) => last_err = Some(format!("Metal device 0 unavailable: {e}")),
+        }
+    }
+
+    if pref == DevicePreference::ForceGpu {
+        let reason = last_err.unwrap_or_else(|| {
+            "this binary was compiled without --features cuda or --features metal".to_string()
+        });
+        return Err(anyhow!(
+            "Force GPU requested, but no working GPU backend is available ({reason}). Rebuild with `cargo build --release --features cuda` (NVIDIA) or `--features metal` (Apple Silicon)."
+        ));
+    }
+
+    Ok((Device::Cpu, "CPU".to_string()))
+}
+
+pub fn select_device(prefer_gpu: bool) -> (Device, String) {
+    let pref = if prefer_gpu {
+        DevicePreference::Auto
+    } else {
+        DevicePreference::Cpu
+    };
+    select_device_checked(pref).unwrap_or((Device::Cpu, "CPU".to_string()))
 }
 
 /// Slaney-normalized mel filterbank matching OpenAI Whisper / faster-whisper.
@@ -248,11 +426,15 @@ where
 }
 
 impl WhisperAligner {
-    pub async fn load<F>(size: WhisperSize, prefer_gpu: bool, mut log: F) -> Result<(Self, String)>
+    pub async fn load<F>(
+        size: WhisperSize,
+        device_pref: DevicePreference,
+        mut log: F,
+    ) -> Result<(Self, String)>
     where
         F: FnMut(String),
     {
-        let (device, dev_label) = select_device(prefer_gpu);
+        let (device, dev_label) = select_device_checked(device_pref)?;
         let (owner, repo_name) = size.repo();
         log(format!(
             "Preparing model {} on {} (cached automatically after first download)...",
@@ -283,7 +465,15 @@ impl WhisperAligner {
         let weights_path: PathBuf =
             download_with_progress(&client, owner, repo_name, "model.safetensors", &mut log).await?;
 
-        log("Loading weights into memory...".to_string());
+        let dtype = if device.is_cuda() {
+            DType::F16
+        } else {
+            DType::F32
+        };
+        log(format!(
+            "Loading weights into memory ({})...",
+            if dtype == DType::F16 { "FP16" } else { "FP32" }
+        ));
         let cfg: Config = serde_json::from_str(
             &std::fs::read_to_string(&config_path).context("Cannot read config.json")?,
         )
@@ -299,7 +489,7 @@ impl WhisperAligner {
 
         let mel_filters = compute_whisper_mel_filters(cfg.num_mel_bins);
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
+            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)
                 .context("Failed to mmap model.safetensors")?
         };
         let model = WhisperModel::load(&vb, cfg).context("Failed to load WhisperModel")?;
@@ -323,6 +513,7 @@ impl WhisperAligner {
                 mel_filters,
                 alignment_heads,
                 device,
+                dtype,
                 sot_token,
                 transcribe_token,
                 no_timestamps_token,
@@ -341,20 +532,11 @@ impl WhisperAligner {
     }
 
     fn build_mel_30s(&self, samples_16k: &[f32]) -> Result<(Tensor, usize)> {
-        let mut padded = vec![0.0_f32; cw::N_SAMPLES];
         let copy_len = samples_16k.len().min(cw::N_SAMPLES);
-        padded[..copy_len].copy_from_slice(&samples_16k[..copy_len]);
-
-        let full_mel = cw::audio::pcm_to_mel(&self.model.config, &padded, &self.mel_filters);
         let n_mels = self.model.config.num_mel_bins;
-        let total_frames = full_mel.len() / n_mels;
-        let mut mel_3000 = Vec::with_capacity(n_mels * cw::N_FRAMES);
-        for m in 0..n_mels {
-            let row_start = m * total_frames;
-            mel_3000.extend_from_slice(&full_mel[row_start..row_start + cw::N_FRAMES]);
-        }
-
-        let mel = Tensor::from_vec(mel_3000, (1, n_mels, cw::N_FRAMES), &self.device)?;
+        let mel_3000 = fast_whisper_mel_30s(&samples_16k[..copy_len], n_mels, &self.mel_filters)?;
+        let mel = Tensor::from_vec(mel_3000, (1, n_mels, cw::N_FRAMES), &self.device)?
+            .to_dtype(self.dtype)?;
         let num_audio_frames = (((copy_len as f64) / 16000.0) * 50.0).ceil() as usize;
         Ok((mel, num_audio_frames.clamp(1, 1500)))
     }
@@ -366,7 +548,11 @@ impl WhisperAligner {
         let xa = self.model.encoder.forward(&mel, true)?;
         let sot = Tensor::new(&[[self.sot_token]], &self.device)?;
         let (hidden, _) = self.model.decoder.forward_with_cross_attn(&sot, &xa, 0, true, false)?;
-        let logits = self.model.decoder.final_linear(&hidden.i((.., 0, ..))?)?;
+        let logits = self
+            .model
+            .decoder
+            .final_linear(&hidden.i((.., 0, ..))?)?
+            .to_dtype(DType::F32)?;
         let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
 
         let candidates = ["ja", "en", "zh", "ko", "id", "es", "fr", "de"];
@@ -583,6 +769,7 @@ impl WhisperAligner {
                     .model
                     .decoder
                     .final_linear(&last_hidden)?
+                    .to_dtype(DType::F32)?
                     .squeeze(0)?
                     .to_vec1()?;
 
@@ -730,4 +917,120 @@ fn dtw(matrix: &[f32], n: usize, m: usize) -> (Vec<usize>, Vec<usize>) {
     ti.reverse();
     tj.reverse();
     (ti, tj)
+}
+
+/// Compute Whisper 30s log-mel spectrogram by running STFT only over active audio frames
+/// and filling the silent remainder with the exact clamped silence floor.
+fn fast_whisper_mel_30s(samples: &[f32], n_mels: usize, filters: &[f32]) -> Result<Vec<f32>> {
+    const N_FFT: usize = cw::N_FFT;
+    const HOP: usize = cw::HOP_LENGTH;
+    const N_FRAMES: usize = cw::N_FRAMES;
+    const N_BINS: usize = N_FFT / 2 + 1;
+
+    let active_frames = if samples.is_empty() {
+        0
+    } else {
+        (samples.len() / HOP + 1).min(N_FRAMES)
+    };
+
+    let hann: Vec<f32> = (0..N_FFT)
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / N_FFT as f32).cos()))
+        .collect();
+
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(N_FFT);
+    let mut fft_in = vec![0.0_f32; N_FFT];
+    let mut spectrum = r2c.make_output_vec();
+    let mut scratch = r2c.make_scratch_vec();
+    let mut power = vec![0.0_f32; N_BINS];
+
+    let mut mel = vec![-10.0_f32; n_mels * N_FRAMES];
+    let mut global_max = -10.0_f32;
+
+    for frame in 0..active_frames {
+        let offset = frame * HOP;
+        let avail = samples.len().saturating_sub(offset).min(N_FFT);
+        for j in 0..avail {
+            fft_in[j] = hann[j] * samples[offset + j];
+        }
+        fft_in[avail..N_FFT].fill(0.0);
+
+        r2c.process_with_scratch(&mut fft_in, &mut spectrum, &mut scratch)
+            .map_err(|e| anyhow!("Mel FFT failed: {e}"))?;
+
+        power[0] = spectrum[0].norm_sqr();
+        for k in 1..N_BINS - 1 {
+            // Double non-DC/Nyquist bins to match candle's full complex FFT folding.
+            power[k] = 2.0 * spectrum[k].norm_sqr();
+        }
+        power[N_BINS - 1] = spectrum[N_BINS - 1].norm_sqr();
+
+        for m in 0..n_mels {
+            let f_row = &filters[m * N_BINS..(m + 1) * N_BINS];
+            let mut sum = 0.0_f32;
+            for k in 0..N_BINS {
+                sum += power[k] * f_row[k];
+            }
+            let log_v = sum.max(1e-10).log10();
+            mel[m * N_FRAMES + frame] = log_v;
+            if log_v > global_max {
+                global_max = log_v;
+            }
+        }
+    }
+
+    let mmax = global_max - 8.0;
+    let pad_val = (-10.0_f32).max(mmax) / 4.0 + 1.0;
+    for m in 0..n_mels {
+        let row = &mut mel[m * N_FRAMES..(m + 1) * N_FRAMES];
+        for v in &mut row[..active_frames] {
+            *v = (*v).max(mmax) / 4.0 + 1.0;
+        }
+        row[active_frames..].fill(pad_val);
+    }
+
+    Ok(mel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_whisper_mel_filters, fast_whisper_mel_30s};
+    use candle_transformers::models::whisper as cw;
+
+    #[test]
+    fn fast_mel_matches_candle_pcm_to_mel() {
+        let cfg = cw::Config {
+            num_mel_bins: 80,
+            max_source_positions: 1500,
+            d_model: 512,
+            encoder_attention_heads: 8,
+            encoder_layers: 6,
+            vocab_size: 51865,
+            decoder_layers: 6,
+            decoder_attention_heads: 8,
+            max_target_positions: 448,
+            suppress_tokens: Vec::new(),
+        };
+        let filters = compute_whisper_mel_filters(80);
+        let active: Vec<f32> = (0..16000)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin())
+            .collect();
+        let mut padded = vec![0.0_f32; cw::N_SAMPLES];
+        padded[..active.len()].copy_from_slice(&active);
+
+        let ref_full = cw::audio::pcm_to_mel(&cfg, &padded, &filters);
+        let ref_stride = ref_full.len() / 80;
+        let fast = fast_whisper_mel_30s(&active, 80, &filters).unwrap();
+
+        let mut max_diff = 0.0_f32;
+        for m in 0..80 {
+            for t in 0..cw::N_FRAMES {
+                let d = (fast[m * cw::N_FRAMES + t] - ref_full[m * ref_stride + t]).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+            }
+        }
+        assert!(max_diff < 1e-4, "max_diff={max_diff}");
+    }
 }

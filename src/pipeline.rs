@@ -5,9 +5,9 @@ use crate::dsp::{
 };
 use crate::segmenter::{
     AlignedLine, InputLine, WordSpan, format_enhanced_lrc, format_wlrc, has_japanese, parse_lrc,
-    segment_line_words, strip_punct_and_space,
+    segment_line_words, shift_aligned_lines, strip_punct_and_space,
 };
-use crate::whisper_align::{AlignedUnit, WhisperAligner, WhisperSize};
+use crate::whisper_align::{AlignedUnit, DevicePreference, WhisperAligner, WhisperSize};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::path::Path;
@@ -16,11 +16,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone)]
 pub struct AlignOptions {
     pub model_size: WhisperSize,
-    pub prefer_gpu: bool,
+    pub device_pref: DevicePreference,
     pub vocal_isolation: bool,
     pub pause_snapping: bool,
     pub language: Option<String>,
     pub raw_lyrics_override: Option<String>,
+    pub offset_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,7 +37,7 @@ pub struct AlignOutput {
 
 #[derive(Default)]
 pub struct ModelCache {
-    inner: Mutex<Option<(WhisperSize, bool, WhisperAligner)>>,
+    inner: Mutex<Option<(WhisperSize, DevicePreference, String, WhisperAligner)>>,
 }
 
 impl ModelCache {
@@ -105,12 +106,12 @@ where
     let vocal_16k = resample_to_16k(&mono_vocal, decoded.sample_rate)?;
     let env10 = compute_vocal_envelope_10ms(&vocal_16k);
 
-    let mut cached_aligner: Option<WhisperAligner> = None;
+    let mut cached_aligner: Option<(String, WhisperAligner)> = None;
     if let Some(ref c) = cache {
         let mut guard = c.inner.lock().unwrap();
-        if let Some((sz, gpu, _)) = guard.as_ref() {
-            if *sz == opts.model_size && *gpu == opts.prefer_gpu {
-                cached_aligner = guard.take().map(|(_, _, a)| a);
+        if let Some((sz, pref, _, _)) = guard.as_ref() {
+            if *sz == opts.model_size && *pref == opts.device_pref {
+                cached_aligner = guard.take().map(|(_, _, dev, a)| (dev, a));
             } else {
                 *guard = None;
             }
@@ -118,14 +119,20 @@ where
     }
 
     let (mut aligner, device_used) = match cached_aligner {
-        Some(a) => {
-            let label = if opts.prefer_gpu { "Cached GPU/CPU model" } else { "Cached CPU model" };
-            on_progress(0.45, format!("Reusing cached {} model...", opts.model_size.display_name()));
-            (a, label.to_string())
+        Some((dev_label, a)) => {
+            on_progress(
+                0.45,
+                format!(
+                    "Reusing cached {} model on {}...",
+                    opts.model_size.display_name(),
+                    dev_label
+                ),
+            );
+            (a, dev_label)
         }
         None => {
             on_progress(0.35, format!("Loading {}...", opts.model_size.display_name()));
-            WhisperAligner::load(opts.model_size, opts.prefer_gpu, |msg| {
+            WhisperAligner::load(opts.model_size, opts.device_pref, |msg| {
                 on_progress(0.40, msg);
             })
             .await?
@@ -160,7 +167,7 @@ where
     on_progress(0.48, format!("Using language '{lang}' on {device_used}"));
 
     if input_lines.is_empty() {
-        on_progress(0.52, "No lyrics provided — running automatic Whisper transcription...".into());
+        on_progress(0.52, "No lyrics provided: running automatic Whisper transcription...".into());
         let coarse = aligner.transcribe_coarse(&vocal_16k, &lang)?;
         if coarse.is_empty() {
             return Err(anyhow!("Could not detect any sung/spoken lyrics in audio"));
@@ -175,7 +182,7 @@ where
     } else if !is_synced {
         on_progress(
             0.52,
-            "Untimed plain lyrics detected — locating coarse line timestamps via Whisper...".into(),
+            "Untimed plain lyrics detected: locating coarse line timestamps via Whisper...".into(),
         );
         let coarse = aligner.transcribe_coarse(&vocal_16k, &lang)?;
         input_lines = map_plain_lines_to_coarse(&input_lines, &coarse, &env10, duration);
@@ -253,8 +260,10 @@ where
 
     if let Some(ref c) = cache {
         let mut guard = c.inner.lock().unwrap();
-        *guard = Some((opts.model_size, opts.prefer_gpu, aligner));
+        *guard = Some((opts.model_size, opts.device_pref, device_used.clone(), aligner));
     }
+
+    let aligned_lines = shift_aligned_lines(&aligned_lines, opts.offset_ms);
 
     let enhanced_lrc = format_enhanced_lrc(
         &aligned_lines,
@@ -537,7 +546,8 @@ fn proportional_map(
         .collect()
 }
 
-/// Anchor untimed plain lyrics lines to coarse Whisper transcription timestamps & vocal activity.
+/// Anchor untimed plain lyrics lines to coarse Whisper transcription timestamps,
+/// skipping instrumental gaps by matching normalized character bigrams monotonically.
 fn map_plain_lines_to_coarse(
     plain: &[InputLine],
     coarse: &[crate::whisper_align::CoarseLine],
@@ -556,25 +566,175 @@ fn map_plain_lines_to_coarse(
             .collect();
     }
 
-    let first_vocal = coarse.first().map(|c| c.start).unwrap_or(0.0);
-    let last_vocal = coarse.last().map(|c| c.end).unwrap_or(duration);
-    let span = (last_vocal - first_vocal).max(1.0);
-    let total_chars: usize = plain
-        .iter()
-        .map(|l| l.text.chars().count().max(1))
-        .sum::<usize>()
-        .max(1);
+    // Build a continuous active-speech character stream `(char, timestamp)` from coarse segments.
+    let mut stream_chars: Vec<char> = Vec::new();
+    let mut stream_times: Vec<f64> = Vec::new();
+    for seg in coarse {
+        let clean: Vec<char> = strip_punct_and_space(&seg.text)
+            .to_lowercase()
+            .chars()
+            .collect();
+        if clean.is_empty() {
+            continue;
+        }
+        let span = (seg.end - seg.start).max(0.05);
+        for (idx, ch) in clean.iter().enumerate() {
+            stream_chars.push(*ch);
+            stream_times.push(seg.start + span * (idx as f64 / clean.len() as f64));
+        }
+    }
 
-    let mut acc = 0usize;
+    if stream_chars.is_empty() {
+        let first_vocal = coarse.first().map(|c| c.start).unwrap_or(0.0);
+        let last_vocal = coarse.last().map(|c| c.end).unwrap_or(duration);
+        let span = (last_vocal - first_vocal).max(1.0);
+        return plain
+            .iter()
+            .enumerate()
+            .map(|(i, l)| InputLine {
+                timestamp: first_vocal + span * (i as f64 / plain.len().max(1) as f64),
+                text: l.text.clone(),
+            })
+            .collect();
+    }
+
+    let n_stream = stream_chars.len();
+    let line_norms: Vec<Vec<char>> = plain
+        .iter()
+        .map(|l| strip_punct_and_space(&l.text).to_lowercase().chars().collect())
+        .collect();
+    let total_plain_chars: usize = line_norms.iter().map(|v| v.len().max(1)).sum::<usize>().max(1);
+
+    let mut anchors: Vec<Option<usize>> = vec![None; plain.len()];
+    let mut cursor = 0usize;
+    let mut plain_acc = 0usize;
+
+    for (idx, chars) in line_norms.iter().enumerate() {
+        let expected_pos = (plain_acc * n_stream) / total_plain_chars;
+        plain_acc += chars.len().max(1);
+
+        if chars.len() >= 3 {
+            let win_len = chars.len().min(n_stream);
+            let search_start = cursor.min(n_stream.saturating_sub(win_len));
+            let search_end = (expected_pos + (n_stream / 3).max(win_len * 4))
+                .min(n_stream.saturating_sub(win_len));
+
+            let mut best_pos = None;
+            let mut best_score = 0.35_f64;
+            if search_start <= search_end {
+                for pos in search_start..=search_end {
+                    let s = char_bigram_similarity(chars, &stream_chars[pos..pos + win_len]);
+                    if s > best_score {
+                        best_score = s;
+                        best_pos = Some(pos);
+                    }
+                }
+            }
+            if let Some(p) = best_pos {
+                anchors[idx] = Some(p);
+                cursor = (p + chars.len() / 2).min(n_stream.saturating_sub(1));
+            }
+        }
+    }
+
+    // Fill unanchored lines by interpolating stream positions between nearest anchors.
+    let mut resolved_pos = vec![0usize; plain.len()];
+    let mut last_anchor: Option<(usize, usize)> = None;
+    for i in 0..plain.len() {
+        if let Some(p) = anchors[i] {
+            let prev_i = last_anchor.map(|(li, _)| li + 1).unwrap_or(0);
+            let prev_p = last_anchor.map(|(_, lp)| lp).unwrap_or(0);
+            fill_stream_positions(&mut resolved_pos, &line_norms, prev_i, i, prev_p, p);
+            resolved_pos[i] = p;
+            last_anchor = Some((i, p));
+        }
+    }
+    let tail_start = last_anchor.map(|(li, _)| li + 1).unwrap_or(0);
+    let tail_p = last_anchor.map(|(_, lp)| lp).unwrap_or(0);
+    fill_stream_positions(
+        &mut resolved_pos,
+        &line_norms,
+        tail_start,
+        plain.len(),
+        tail_p,
+        n_stream.saturating_sub(1),
+    );
+
+    let mut prev_t = 0.0_f64;
     plain
         .iter()
-        .map(|l| {
-            let t = first_vocal + span * (acc as f64 / total_chars as f64);
-            acc += l.text.chars().count().max(1);
+        .enumerate()
+        .map(|(i, l)| {
+            let p = resolved_pos[i].min(stream_times.len() - 1);
+            let t = stream_times[p].max(prev_t);
+            prev_t = t + 0.05;
             InputLine {
-                timestamp: t,
+                timestamp: t.min(duration),
                 text: l.text.clone(),
             }
         })
         .collect()
+}
+
+fn fill_stream_positions(
+    out: &mut [usize],
+    norms: &[Vec<char>],
+    start_idx: usize,
+    end_idx: usize,
+    start_pos: usize,
+    end_pos: usize,
+) {
+    if start_idx >= end_idx {
+        return;
+    }
+    let span = end_pos.saturating_sub(start_pos);
+    let weight_sum: usize = norms[start_idx..end_idx]
+        .iter()
+        .map(|v| v.len().max(1))
+        .sum::<usize>()
+        .max(1);
+    let mut acc = 0usize;
+    for i in start_idx..end_idx {
+        out[i] = start_pos + (span * acc) / weight_sum;
+        acc += norms[i].len().max(1);
+    }
+}
+
+fn char_bigram_similarity(a: &[char], b: &[char]) -> f64 {
+    if a.len() < 2 || b.len() < 2 {
+        return 0.0;
+    }
+    let mut hits = 0usize;
+    for pair in a.windows(2) {
+        if b.windows(2).any(|bp| bp == pair) {
+            hits += 1;
+        }
+    }
+    (2.0 * hits as f64) / ((a.len() - 1 + b.len() - 1) as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_plain_lines_to_coarse;
+    use crate::segmenter::InputLine;
+    use crate::whisper_align::CoarseLine;
+
+    #[test]
+    fn plain_lyrics_anchor_across_instrumental_gap() {
+        let plain = vec![
+            InputLine { timestamp: 0.0, text: "High dive into frozen waves".into() },
+            InputLine { timestamp: 0.0, text: "Where the past comes back to life".into() },
+            InputLine { timestamp: 0.0, text: "Walk on through a red parade".into() },
+        ];
+        let coarse = vec![
+            CoarseLine { start: 10.0, end: 13.0, text: "High dive into frozen waves".into() },
+            CoarseLine { start: 13.5, end: 16.5, text: "Where the past comes back to life".into() },
+            // 60-second instrumental break before verse 2
+            CoarseLine { start: 76.0, end: 79.0, text: "Walk on through a red parade".into() },
+        ];
+        let mapped = map_plain_lines_to_coarse(&plain, &coarse, &[], 120.0);
+        assert!((mapped[0].timestamp - 10.0).abs() < 0.5);
+        assert!((mapped[1].timestamp - 13.5).abs() < 0.5);
+        assert!((mapped[2].timestamp - 76.0).abs() < 0.5);
+    }
 }

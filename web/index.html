@@ -290,6 +290,30 @@
     font-family: var(--mono);
     font-size: 12px;
   }
+  .offset-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .offset-row input[type="number"] {
+    width: 92px;
+    min-height: 44px;
+    background: #10131a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 8px 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    text-align: center;
+  }
+  button.btn.offset-btn {
+    min-width: 48px;
+    padding: 9px 10px;
+    font-family: var(--mono);
+  }
   .progress-wrap {
     height: 7px;
     background: #10131a;
@@ -392,6 +416,53 @@
     background: rgba(77, 163, 255, 0.12);
   }
   audio { width: 100%; margin-top: 8px; }
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .doctor-panel {
+    display: none;
+    max-width: 980px;
+    margin: 14px auto 0;
+    padding: 0 18px;
+  }
+  .doctor-panel.open { display: block; }
+  .doctor-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .doctor-list {
+    list-style: none;
+    margin: 10px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .doctor-row {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 13px;
+    font-family: var(--mono);
+  }
+  .doc-tag {
+    min-width: 44px;
+    text-align: center;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .doc-tag.ok { background: rgba(61, 220, 151, 0.14); color: #6ee7b7; }
+  .doc-tag.warn { background: rgba(249, 171, 0, 0.14); color: #ffd166; }
+  .doc-tag.fail { background: rgba(255, 107, 107, 0.16); color: #ffb3b3; }
+  .doc-name { color: var(--text); font-weight: 600; }
+  .doc-detail { color: var(--muted); word-break: break-word; }
   @media (max-width: 640px) {
     header { padding: 12px 14px; }
     main { padding: 0 12px; margin-top: 14px; }
@@ -420,8 +491,25 @@
     <h1>lrc-align</h1>
     <span class="hw-status" id="hwBadge">Checking runtime device...</span>
   </div>
-  <span class="privacy-note">Localhost processing: audio stays on your machine</span>
+  <div class="header-actions">
+    <span class="privacy-note">Localhost processing: audio stays on your machine</span>
+    <button type="button" class="btn" id="doctorBtn" aria-expanded="false" aria-controls="doctorPanel">Verify System</button>
+  </div>
 </header>
+
+<section class="doctor-panel" id="doctorPanel" aria-label="System dependency verification">
+  <div class="doctor-card">
+    <div class="cell-header" style="margin-bottom:4px;">
+      <h2>System &amp; Dependency Check</h2>
+      <div class="btn-row" style="margin-top:0;">
+        <button type="button" class="btn" id="doctorRefreshBtn">Re-check</button>
+        <button type="button" class="btn" id="doctorCloseBtn">Close</button>
+      </div>
+    </div>
+    <div id="doctorStatus" style="font-size:12px;color:var(--muted);">Click Re-check to probe GPU kernels, embedded tokenizers, model cache, and network.</div>
+    <ul class="doctor-list" id="doctorList"></ul>
+  </div>
+</section>
 
 <main>
   <section class="cell" id="cell1" aria-labelledby="cell1-title">
@@ -478,11 +566,18 @@
             <option value="zh">Chinese</option>
           </select>
         </label>
+        <label class="field" for="deviceSelect">
+          Execution Device
+          <select id="deviceSelect">
+            <option value="auto" selected>Auto · GPU if available</option>
+            <option value="force-gpu">Force GPU · fail without GPU</option>
+            <option value="cpu">CPU only</option>
+          </select>
+        </label>
       </div>
       <div class="check-row">
         <label for="vocalIsoCheck"><input type="checkbox" id="vocalIsoCheck" checked /> Center-vocal STFT isolation</label>
         <label for="pauseSnapCheck"><input type="checkbox" id="pauseSnapCheck" checked /> Vocal-envelope pause snapping</label>
-        <label for="gpuCheck"><input type="checkbox" id="gpuCheck" checked /> Prefer GPU acceleration</label>
         <label for="replaceOrigCheck"><input type="checkbox" id="replaceOrigCheck" /> Overwrite original audio file</label>
         <label for="writeSidecarLrcCheck"><input type="checkbox" id="writeSidecarLrcCheck" /> Also write/replace .lrc next to original</label>
       </div>
@@ -529,6 +624,15 @@
 
       <div id="resultPanel" style="display:none;">
         <audio id="audioPlayer" controls></audio>
+        <div class="offset-row">
+          <label class="field-label" for="offsetInput" style="margin:0;">Timing offset ms</label>
+          <button type="button" class="btn offset-btn" data-delta="-50">-50</button>
+          <button type="button" class="btn offset-btn" data-delta="-20">-20</button>
+          <input type="number" id="offsetInput" value="0" step="10" min="-2000" max="2000" />
+          <button type="button" class="btn offset-btn" data-delta="20">+20</button>
+          <button type="button" class="btn offset-btn" data-delta="50">+50</button>
+          <button type="button" class="btn" id="offsetResetBtn">Reset</button>
+        </div>
         <div class="karaoke-stage" id="karaokeStage"></div>
 
         <div class="btn-row">
@@ -563,6 +667,8 @@ let audioUrl = null;
 let previewFallbackApplied = false;
 let karaokeNodes = [];
 let activeSource = null;
+let lyricsOrigin = 'none';
+let offsetMs = 0;
 
 fetch('/api/capabilities').then(r => r.json()).then(c => {
   const b = $('hwBadge');
@@ -570,14 +676,57 @@ fetch('/api/capabilities').then(r => r.json()).then(c => {
     b.textContent = c.device;
     b.classList.add('gpu');
   } else if (c.cuda_compiled) {
-    b.textContent = 'CUDA Compiled (CPU fallback)';
+    b.textContent = 'CUDA Compiled · CPU fallback';
   } else if (c.metal_compiled) {
-    b.textContent = 'Metal Compiled (CPU fallback)';
+    b.textContent = 'Metal Compiled · CPU fallback';
   } else {
     b.textContent = 'CPU Mode';
   }
+  const cached = new Set(c.cached_models || []);
+  for (const opt of $('modelSelect').options) {
+    if (cached.has(opt.value) && !opt.textContent.includes('cached')) {
+      opt.textContent = `${opt.textContent} · cached`;
+    }
+  }
+  if (c.default_device_mode) {
+    $('deviceSelect').value = c.default_device_mode;
+  }
 }).catch(() => {
   $('hwBadge').textContent = 'Device check failed';
+});
+
+async function runDoctorCheck() {
+  $('doctorStatus').textContent = 'Running system and dependency checks...';
+  $('doctorList').innerHTML = '';
+  $('doctorRefreshBtn').disabled = true;
+  try {
+    const res = await fetch('/api/doctor');
+    if (!res.ok) throw new Error(await res.text());
+    const rep = await res.json();
+    $('doctorStatus').textContent = rep.ok
+      ? `All required checks passed. Active runtime: ${rep.device}.`
+      : 'One or more checks reported issues.';
+    $('doctorList').innerHTML = (rep.checks || []).map(item => {
+      const cls = item.status === 'ok' ? 'ok' : item.status === 'warn' ? 'warn' : 'fail';
+      const label = cls.toUpperCase();
+      return `<li class="doctor-row"><span class="doc-tag ${cls}">${label}</span><span class="doc-name">${esc(item.name)}:</span><span class="doc-detail">${esc(item.detail)}</span></li>`;
+    }).join('');
+  } catch (err) {
+    $('doctorStatus').textContent = `Verification failed: ${err.message}`;
+  } finally {
+    $('doctorRefreshBtn').disabled = false;
+  }
+}
+
+$('doctorBtn').addEventListener('click', () => {
+  const open = $('doctorPanel').classList.toggle('open');
+  $('doctorBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) runDoctorCheck();
+});
+$('doctorRefreshBtn').addEventListener('click', runDoctorCheck);
+$('doctorCloseBtn').addEventListener('click', () => {
+  $('doctorPanel').classList.remove('open');
+  $('doctorBtn').setAttribute('aria-expanded', 'false');
 });
 
 const dz = $('dropzone');
@@ -606,13 +755,18 @@ dz.addEventListener('drop', async e => {
 fi.addEventListener('change', e => handleFiles(e.target.files));
 
 async function handleFiles(files) {
-  for (const f of files) {
-    const ext = f.name.split('.').pop().toLowerCase();
-    if (ext === 'lrc' || ext === 'txt' || ext === 'wlrc') {
+  const list = [...files];
+  const hasLyricsFile = list.some(f => /\.(lrc|txt|wlrc)$/i.test(f.name));
+  for (const f of list) {
+    if (/\.(lrc|txt|wlrc)$/i.test(f.name)) {
       $('lyricsInput').value = await f.text();
+      lyricsOrigin = 'dropped';
       $('lyricsHint').textContent = `Loaded lyrics from ${f.name}`;
-    } else {
-      await loadAudioFile(f);
+    }
+  }
+  for (const f of list) {
+    if (!/\.(lrc|txt|wlrc)$/i.test(f.name)) {
+      await loadAudioFile(f, hasLyricsFile);
     }
   }
 }
@@ -648,11 +802,13 @@ async function locateOriginal(file) {
   }
 }
 
-async function loadAudioFile(file) {
+async function loadAudioFile(file, preserveLyrics = false) {
   selectedAudioFile = file;
   currentJobId = null;
   lastOutput = null;
   previewFallbackApplied = false;
+  offsetMs = 0;
+  $('offsetInput').value = '0';
   const player = $('audioPlayer');
   player.pause();
   player.removeAttribute('src');
@@ -666,6 +822,10 @@ async function loadAudioFile(file) {
   $('emptyResult').style.display = 'block';
   $('karaokeStage').innerHTML = '';
   $('outputBox').value = '';
+  if (!preserveLyrics && (lyricsOrigin === 'embedded' || lyricsOrigin === 'lrclib' || lyricsOrigin === 'none')) {
+    $('lyricsInput').value = '';
+    lyricsOrigin = 'none';
+  }
   $('fileStatus').textContent = `${file.name} (${(file.size / 1048576).toFixed(1)} MB)`;
   $('runBtn').disabled = false;
   $('runBtnText').disabled = false;
@@ -693,14 +853,19 @@ async function loadAudioFile(file) {
     $('metaRow').style.display = pills.length ? 'flex' : 'none';
     if (m.lyrics && !$('lyricsInput').value.trim()) {
       $('lyricsInput').value = m.lyrics;
+      lyricsOrigin = 'embedded';
       $('lyricsHint').textContent = 'Loaded embedded lyrics from audio tags.';
-    } else if (!m.lyrics) {
+    } else if (!m.lyrics && !$('lyricsInput').value.trim()) {
       $('lyricsHint').textContent = 'No embedded lyrics found. Paste lyrics, fetch from LRCLIB, or leave blank to auto-transcribe.';
     }
   } catch (err) {
     $('lyricsHint').textContent = 'Could not read metadata tags. Audio decoding will still run.';
   }
 }
+
+$('lyricsInput').addEventListener('input', () => {
+  lyricsOrigin = $('lyricsInput').value.trim() ? 'manual' : 'none';
+});
 
 $('lrclibBtn').addEventListener('click', async () => {
   const title = lastMeta?.title || selectedAudioFile?.name.replace(/\.[^.]+$/, '') || '';
@@ -721,6 +886,7 @@ $('lrclibBtn').addEventListener('click', async () => {
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     $('lyricsInput').value = data.lyrics;
+    lyricsOrigin = 'lrclib';
     $('lyricsHint').textContent = `Fetched from ${data.source}.`;
   } catch (e) {
     $('lyricsHint').textContent = `LRCLIB lookup failed: ${e.message}`;
@@ -731,6 +897,7 @@ $('lrclibBtn').addEventListener('click', async () => {
 
 $('clearLyricsBtn').addEventListener('click', () => {
   $('lyricsInput').value = '';
+  lyricsOrigin = 'none';
   $('lyricsHint').textContent = 'Cleared: Whisper will auto-transcribe the audio.';
 });
 
@@ -792,7 +959,7 @@ async function startRun() {
   fd.append('language', $('langSelect').value);
   fd.append('vocal_isolation', $('vocalIsoCheck').checked ? 'true' : 'false');
   fd.append('pause_snapping', $('pauseSnapCheck').checked ? 'true' : 'false');
-  fd.append('prefer_gpu', $('gpuCheck').checked ? 'true' : 'false');
+  fd.append('device_mode', $('deviceSelect').value);
 
   try {
     const res = await fetch('/api/align', { method: 'POST', body: fd });
@@ -843,18 +1010,106 @@ $('runBtnText').addEventListener('click', startRun);
 
 function showResult(out) {
   lastOutput = out;
+  offsetMs = 0;
+  $('offsetInput').value = '0';
   $('emptyResult').style.display = 'none';
   $('resultPanel').style.display = 'block';
   $('resultSummary').textContent = `${out.lines.length} lines | ${out.language} | ${out.device_used} | ${out.elapsed_secs.toFixed(1)}s`;
   ensurePlayablePreview();
   renderOutputText();
-  buildKaraoke(out.lines);
+  buildKaraoke(getShiftedLines());
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   $('cell4').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'nearest' });
   if ($('replaceOrigCheck').checked) {
     performReplaceOriginal(true);
   }
 }
+
+function getShiftedLines() {
+  if (!lastOutput) return [];
+  const dt = offsetMs / 1000;
+  if (Math.abs(offsetMs) < 0.01) return lastOutput.lines;
+  return lastOutput.lines.map(line => {
+    let cursor = 0;
+    const words = line.words.map(w => {
+      const start = Math.max(cursor, w.start + dt);
+      const end = Math.max(start + 0.02, w.end + dt);
+      cursor = end;
+      return { text: w.text, start, end };
+    });
+    const start = words.length ? words[0].start : Math.max(0, line.start + dt);
+    const end = words.length ? words[words.length - 1].end : Math.max(start + 0.02, line.end + dt);
+    return { start, end, text: line.text, words };
+  });
+}
+
+function fmtTs(secs) {
+  const s = Math.max(0, secs);
+  const mins = Math.floor(s / 60);
+  const rem = s - mins * 60;
+  return `${String(mins).padStart(2, '0')}:${rem.toFixed(2).padStart(5, '0')}`;
+}
+
+function buildHeaderLines(meta) {
+  const out = [];
+  if (meta?.title) out.push(`[ti:${meta.title}]`);
+  if (meta?.artist) out.push(`[ar:${meta.artist}]`);
+  if (meta?.album) out.push(`[al:${meta.album}]`);
+  if (out.length) out.push('');
+  return out;
+}
+
+function formatShiftedEnhancedLrc(lines, meta) {
+  const out = buildHeaderLines(meta);
+  for (const line of lines) {
+    if (!line.words.length) continue;
+    let s = `[${fmtTs(line.words[0].start)}]`;
+    for (let i = 0; i < line.words.length; i++) {
+      const w = line.words[i];
+      s += `<${fmtTs(w.start)}>${w.text}`;
+      const next = line.words[i + 1];
+      if (!next || next.start - w.end >= 0.14) {
+        s += `<${fmtTs(w.end)}>`;
+      }
+    }
+    out.push(s);
+  }
+  return out.join('\n') + '\n';
+}
+
+function formatShiftedWlrc(lines, meta) {
+  const out = buildHeaderLines(meta);
+  for (const line of lines) {
+    for (const w of line.words) {
+      const trimmed = w.text.trim();
+      if (trimmed) out.push(`[${fmtTs(w.start)}]${trimmed}`);
+    }
+  }
+  return out.join('\n') + '\n';
+}
+
+function applyOffset(newMs) {
+  const clamped = Math.max(-2000, Math.min(2000, Math.round(Number(newMs) || 0)));
+  offsetMs = clamped;
+  $('offsetInput').value = String(clamped);
+  if (!lastOutput) return;
+  const shifted = getShiftedLines();
+  for (let i = 0; i < karaokeNodes.length && i < shifted.length; i++) {
+    karaokeNodes[i].start = shifted[i].start;
+    karaokeNodes[i].end = shifted[i].end;
+    for (let j = 0; j < karaokeNodes[i].words.length && j < shifted[i].words.length; j++) {
+      karaokeNodes[i].words[j].start = shifted[i].words[j].start;
+      karaokeNodes[i].words[j].end = shifted[i].words[j].end;
+    }
+  }
+  renderOutputText();
+}
+
+document.querySelectorAll('.offset-btn').forEach(btn => {
+  btn.addEventListener('click', () => applyOffset(offsetMs + Number(btn.dataset.delta)));
+});
+$('offsetInput').addEventListener('change', () => applyOffset($('offsetInput').value));
+$('offsetResetBtn').addEventListener('click', () => applyOffset(0));
 
 async function performReplaceOriginal(isAuto = false) {
   if (!currentJobId) return;
@@ -870,7 +1125,7 @@ async function performReplaceOriginal(isAuto = false) {
       const res = await fetch(`/api/jobs/${currentJobId}/replace`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target_path: targetPath, write_sidecar_lrc: writeSidecar }),
+        body: JSON.stringify({ target_path: targetPath, write_sidecar_lrc: writeSidecar, offset_ms: offsetMs }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
@@ -885,7 +1140,7 @@ async function performReplaceOriginal(isAuto = false) {
         const perm = await selectedFileHandle.requestPermission({ mode: 'readwrite' });
         if (perm !== 'granted') throw new Error('Write permission denied by browser');
       }
-      const res = await fetch(`/api/jobs/${currentJobId}/download/embedded`);
+      const res = await fetch(`/api/jobs/${currentJobId}/download/embedded?offset_ms=${encodeURIComponent(offsetMs)}`);
       if (!res.ok) throw new Error(await res.text());
       const writable = await selectedFileHandle.createWritable();
       await writable.write(await res.blob());
@@ -910,7 +1165,14 @@ $('replaceOrigBtn').addEventListener('click', () => performReplaceOriginal(false
 
 function renderOutputText() {
   if (!lastOutput) return;
-  $('outputBox').value = activeFmt === 'lrc' ? lastOutput.enhanced_lrc : lastOutput.wlrc;
+  if (Math.abs(offsetMs) < 0.01) {
+    $('outputBox').value = activeFmt === 'lrc' ? lastOutput.enhanced_lrc : lastOutput.wlrc;
+  } else {
+    const shifted = getShiftedLines();
+    $('outputBox').value = activeFmt === 'lrc'
+      ? formatShiftedEnhancedLrc(shifted, lastOutput.metadata)
+      : formatShiftedWlrc(shifted, lastOutput.metadata);
+  }
 }
 
 document.querySelectorAll('.tab').forEach(tab => {
@@ -932,9 +1194,27 @@ $('copyBtn').addEventListener('click', async () => {
   setTimeout(() => $('copyBtn').textContent = 'Copy Output', 1500);
 });
 
-$('dlLrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/lrc`; });
-$('dlWlrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/wlrc`; });
-$('dlEmbedBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/embedded`; });
+function dlQuery() {
+  return offsetMs ? `?offset_ms=${encodeURIComponent(offsetMs)}` : '';
+}
+$('dlLrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/lrc${dlQuery()}`; });
+$('dlWlrcBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/wlrc${dlQuery()}`; });
+$('dlEmbedBtn').addEventListener('click', () => { if (currentJobId) window.location.href = `/api/jobs/${currentJobId}/download/embedded${dlQuery()}`; });
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !$('runBtn').disabled) {
+    e.preventDefault();
+    startRun();
+    return;
+  }
+  const tag = document.activeElement?.tagName;
+  if (e.code === 'Space' && $('resultPanel').style.display === 'block' && !['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(tag)) {
+    e.preventDefault();
+    const p = $('audioPlayer');
+    if (p.paused) p.play().catch(() => {});
+    else p.pause();
+  }
+});
 
 function buildKaraoke(lines) {
   const stage = $('karaokeStage');
@@ -951,14 +1231,15 @@ function buildKaraoke(lines) {
       btn.appendChild(span);
       return { el: span, start: w.start, end: w.end };
     });
+    const node = { btn, start: line.start, end: line.end, words: wordEls };
     btn.addEventListener('click', () => {
-      if (!ensurePlayablePreview(line.start)) {
-        $('audioPlayer').currentTime = line.start;
+      if (!ensurePlayablePreview(node.start)) {
+        $('audioPlayer').currentTime = node.start;
         $('audioPlayer').play().catch(() => {});
       }
     });
     stage.appendChild(btn);
-    return { btn, start: line.start, end: line.end, words: wordEls };
+    return node;
   });
 }
 
