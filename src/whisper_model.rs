@@ -340,6 +340,10 @@ impl TextDecoder {
     }
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
+        // Callers pass either [batch, seq, d] or a single position sliced down to [batch, d].
+        if x.rank() == 2 {
+            return x.matmul(&self.token_embedding.embeddings().t()?);
+        }
         let b_size = x.dim(0)?;
         let w = self.token_embedding.embeddings().broadcast_left(b_size)?;
         x.matmul(&w.t()?)

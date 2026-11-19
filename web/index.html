@@ -338,6 +338,27 @@
     font-size: 13px;
   }
   .error-banner.visible { display: block; }
+  .quality-warning {
+    display: none;
+    margin-bottom: 14px;
+    padding: 16px 18px;
+    border-radius: 10px;
+    background: rgba(249, 171, 0, 0.10);
+    border: 1px solid rgba(249, 171, 0, 0.55);
+    border-left: 6px solid var(--accent);
+  }
+  .quality-warning.visible { display: block; }
+  .quality-warning.severe {
+    background: rgba(255, 107, 107, 0.10);
+    border-color: rgba(255, 107, 107, 0.55);
+    border-left-color: var(--red);
+  }
+  .qw-title { margin: 0 0 4px; font-size: 18px; font-weight: 700; line-height: 1.3; color: #ffd166; }
+  .quality-warning.severe .qw-title { color: #ffb3b3; }
+  .qw-sub { margin: 0 0 10px; font-size: 14px; color: var(--text); }
+  .qw-list { margin: 0 0 4px; padding-left: 18px; font-size: 13px; color: var(--muted); }
+  .qw-list li + li { margin-top: 4px; }
+  .quality-warning .btn-row { margin-top: 10px; }
   pre.logbox {
     margin: 0;
     background: #0b0d12;
@@ -626,6 +647,7 @@
       </div>
 
       <div id="resultPanel" style="display:none;">
+        <div class="quality-warning" id="qualityWarning" role="alert"></div>
         <audio id="audioPlayer" controls></audio>
         <div class="offset-row">
           <label class="field-label" for="offsetInput" style="margin:0;">Timing offset ms</label>
@@ -809,6 +831,7 @@ async function loadAudioFile(file, preserveLyrics = false) {
   selectedAudioFile = file;
   currentJobId = null;
   lastOutput = null;
+  hideQualityWarning();
   previewFallbackApplied = false;
   offsetMs = 0;
   $('offsetInput').value = '0';
@@ -950,6 +973,7 @@ async function startRun() {
   currentJobId = null;
   previewFallbackApplied = false;
   $('errorBanner').classList.remove('visible');
+  hideQualityWarning();
   setRunning(true);
   $('progressBar').style.width = '2%';
   $('progressWrap').setAttribute('aria-valuenow', '2');
@@ -1022,11 +1046,182 @@ function showResult(out) {
   ensurePlayablePreview();
   renderOutputText();
   buildKaraoke(getShiftedLines());
+  const quality = analyzeQuality(out);
+  showQualityWarning(quality);
   const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   $('cell4').scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'nearest' });
   if ($('replaceOrigCheck').checked) {
-    performReplaceOriginal(true);
+    if (quality) {
+      // Writing unreliable timings into the file would poison the next run, which reads them back as anchors.
+      $('replaceStatus').textContent = 'Auto-overwrite skipped because this result looks unreliable. Click Overwrite Original File if you still want it.';
+      $('replaceStatus').style.color = 'var(--accent)';
+    } else {
+      performReplaceOriginal(true);
+    }
   }
+}
+
+const LANG_NAMES = { en: 'English', id: 'Indonesian', ja: 'Japanese', ko: 'Korean', zh: 'Chinese', ru: 'Russian' };
+const ID_STOPWORDS = new Set(['yang', 'dan', 'di', 'ke', 'aku', 'kau', 'ku', 'tak', 'gak', 'ini', 'itu', 'dengan', 'untuk', 'kini', 'akan', 'dalam', 'tidak', 'sudah', 'udah', 'kita', 'kamu', 'engkau', 'hati', 'cinta']);
+const EN_STOPWORDS = new Set(['the', 'and', 'you', 'i', 'to', 'my', 'is', 'of', 'in', 'it', 'that', 'me', 'your', 'are', 'why', 'we', 'what', 'love', 'know', 'don\'t', 'can\'t']);
+
+function expectedLyricsLanguage(text) {
+  if (/[\u3040-\u30ff]/.test(text)) return 'ja';
+  if (/[\uac00-\ud7af]/.test(text)) return 'ko';
+  if (/[\u4e00-\u9fff]/.test(text)) return 'zh';
+  if (/[\u0400-\u04ff]/.test(text)) return 'ru';
+  const words = text.toLowerCase().replace(/\[[^\]]*\]|<[^>]*>/g, ' ').match(/[a-z']+/g) || [];
+  let id = 0, en = 0;
+  for (const w of words) {
+    if (ID_STOPWORDS.has(w)) id++;
+    if (EN_STOPWORDS.has(w)) en++;
+  }
+  if (id >= 4 && id >= en * 2) return 'id';
+  if (en >= 4 && en >= id * 2) return 'en';
+  return null;
+}
+
+function analyzeQuality(out) {
+  const lines = out.lines || [];
+  if (!lines.length) return null;
+  const confOf = l => (typeof l.confidence === 'number' ? l.confidence : 1);
+  const weak = [];
+  lines.forEach((l, i) => { if (confOf(l) < 0.5) weak.push(i); });
+  const overall = typeof out.confidence === 'number' ? out.confidence : 1;
+  const ratio = weak.length / lines.length;
+  if (overall >= 0.7 && weak.length < 3 && ratio < 0.1) return null;
+
+  const severe = overall < 0.55 || ratio >= 0.3;
+  const lyricsText = $('lyricsInput').value;
+  const reasons = [];
+  const actions = [];
+  let title = 'This song seems to be hard to align';
+
+  // Longest run of consecutive weak lines: a cluster points at one section (bridge, rap verse, ad-libs).
+  let bestStart = -1, bestLen = 0, runStart = -1, runLen = 0, prev = -2;
+  for (const i of weak) {
+    if (i === prev + 1) runLen++;
+    else { runStart = i; runLen = 1; }
+    if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
+    prev = i;
+  }
+  const clustered = bestLen >= 3 && bestLen >= weak.length * 0.6 && ratio < 0.6;
+
+  // Words per second using the gap to the next line start, so collapsed word timings do not inflate it.
+  const rates = weak.map(i => {
+    const l = lines[i];
+    const next = lines[i + 1];
+    const slot = Math.min(12, Math.max(0.4, (next ? next.start : l.end) - l.start));
+    return (l.words?.length || 0) / slot;
+  }).sort((a, b) => a - b);
+  const medianRate = rates.length ? rates[Math.floor(rates.length / 2)] : 0;
+  const fast = medianRate > 3.2;
+
+  const hadWordTags = /<\d{1,2}:\d{2}(?:\.\d{1,3})?>/.test(lyricsText);
+  const expected = expectedLyricsLanguage(lyricsText);
+  const langMismatch = expected && out.language && expected !== out.language;
+  const mostlyWeak = ratio >= 0.6 && overall < 0.5;
+  let mismatchExplained = false;
+
+  if (hadWordTags) {
+    title = 'This song seems to already have word timings from an earlier run';
+    reasons.push('The input lyrics contain word-level tags, so the file was probably overwritten by a previous alignment. Its line times are kept as anchors, so any old mistakes carry over. Clear the lyrics and click Fetch from LRCLIB for a clean copy.');
+  } else if (langMismatch) {
+    title = `This song seems to be in ${LANG_NAMES[expected] || expected}, but it was aligned as ${LANG_NAMES[out.language] || out.language}`;
+    reasons.push('The wrong language makes Whisper read the words badly, which throws off the timing.');
+    actions.push({ label: `Retry as ${LANG_NAMES[expected] || expected}`, run: () => { $('langSelect').value = expected; } });
+  } else if (mostlyWeak) {
+    title = 'This song seems to not match these lyrics';
+    reasons.push('Almost every line failed to lock onto the vocals. Check that the lyrics are for this exact recording, not a different version, remix, live take, or another song.');
+    mismatchExplained = true;
+  } else if (clustered) {
+    const a = lines[bestStart];
+    const b = lines[bestStart + bestLen - 1];
+    title = `This song seems to lose sync from ${fmtTs(a.start)} to ${fmtTs(b.end)}`;
+    reasons.push(`Lines ${bestStart + 1} to ${bestStart + bestLen} are weak. That section may have backing vocals, ad-libs, or lyrics that differ from what is sung.`);
+  } else if (fast) {
+    title = 'This song seems to be too fast or dense for clean word timing';
+    reasons.push('The weak lines pack a lot of words into a short time, as in rap or quick verses. Line starts are usually fine; individual words may drift.');
+  }
+
+  if (severe && !hadWordTags && !mismatchExplained) {
+    reasons.push('The lyrics may not match this recording: a different version, missing or extra lines, or a live take.');
+  }
+  if ($('vocalIsoCheck').checked) {
+    reasons.push('Center-vocal isolation can remove wide or stereo-doubled vocals. Try turning it off.');
+    actions.push({ label: 'Retry without isolation', run: () => { $('vocalIsoCheck').checked = false; } });
+  }
+  const model = $('modelSelect').value;
+  if (model === 'base' || model === 'small') {
+    actions.push({ label: 'Retry with medium model', run: () => { $('modelSelect').value = 'medium'; } });
+  }
+
+  return {
+    severe,
+    title,
+    summary: `${weak.length} of ${lines.length} lines are low confidence (overall ${Math.round(overall * 100)}%). Lines with a yellow bar are probably mistimed.`,
+    reasons,
+    actions,
+    firstWeak: weak.length ? weak[0] : -1,
+  };
+}
+
+function hideQualityWarning() {
+  const box = $('qualityWarning');
+  box.classList.remove('visible', 'severe');
+  box.replaceChildren();
+}
+
+function showQualityWarning(q) {
+  hideQualityWarning();
+  if (!q) return;
+  const box = $('qualityWarning');
+  box.classList.add('visible');
+  if (q.severe) box.classList.add('severe');
+
+  const title = document.createElement('p');
+  title.className = 'qw-title';
+  title.textContent = q.title;
+  const sub = document.createElement('p');
+  sub.className = 'qw-sub';
+  sub.textContent = q.summary;
+  box.append(title, sub);
+
+  if (q.reasons.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'qw-list';
+    for (const r of q.reasons) {
+      const li = document.createElement('li');
+      li.textContent = r;
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+
+  const row = document.createElement('div');
+  row.className = 'btn-row';
+  for (const a of q.actions) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn warn';
+    b.textContent = a.label;
+    b.addEventListener('click', () => { a.run(); startRun(); });
+    row.appendChild(b);
+  }
+  if (q.firstWeak >= 0) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn';
+    b.textContent = 'Show first weak line';
+    b.addEventListener('click', () => {
+      const node = karaokeNodes[q.firstWeak];
+      if (!node) return;
+      node.btn.scrollIntoView({ block: 'center' });
+      node.btn.focus();
+    });
+    row.appendChild(b);
+  }
+  if (row.children.length) box.appendChild(row);
 }
 
 function getShiftedLines() {
