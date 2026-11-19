@@ -4,10 +4,10 @@ use crate::dsp::{
     resample_to_16k,
 };
 use crate::segmenter::{
-    AlignedLine, InputLine, WordSpan, format_enhanced_lrc, format_wlrc, has_japanese, parse_lrc,
-    segment_line_words, shift_aligned_lines, strip_punct_and_space,
+    AlignedLine, InputLine, WordSpan, format_enhanced_lrc, format_wlrc, parse_lrc,
+    segment_line_words, shift_aligned_lines, split_role_prefix, strip_punct_and_space,
 };
-use crate::whisper_align::{AlignedUnit, DevicePreference, WhisperAligner, WhisperSize};
+use crate::whisper_align::{AlignedUnit, AlignmentResult, DevicePreference, WhisperAligner, WhisperSize};
 use anyhow::{Result, anyhow};
 use serde::Serialize;
 use std::path::Path;
@@ -29,6 +29,7 @@ pub struct AlignOutput {
     pub metadata: AudioMetadata,
     pub device_used: String,
     pub language: String,
+    pub confidence: f32,
     pub enhanced_lrc: String,
     pub wlrc: String,
     pub lines: Vec<AlignedLine>,
@@ -83,6 +84,17 @@ where
         ),
     );
 
+    let raw_mono = if decoded.is_stereo {
+        decoded
+            .left
+            .iter()
+            .zip(decoded.right.iter())
+            .map(|(l, r)| 0.5 * (l + r))
+            .collect()
+    } else {
+        decoded.left.clone()
+    };
+
     let mono_vocal = if opts.vocal_isolation && decoded.is_stereo {
         on_progress(0.22, "Isolating center-panned vocals (STFT Wiener mask)...".into());
         isolate_center_vocals(
@@ -91,19 +103,18 @@ where
             decoded.is_stereo,
             decoded.sample_rate,
         )?
-    } else if decoded.is_stereo {
-        decoded
-            .left
-            .iter()
-            .zip(decoded.right.iter())
-            .map(|(l, r)| 0.5 * (l + r))
-            .collect()
     } else {
-        decoded.left
+        raw_mono.clone()
     };
 
     on_progress(0.30, "Resampling to 16 kHz & extracting 10 ms vocal-band envelope...".into());
     let vocal_16k = resample_to_16k(&mono_vocal, decoded.sample_rate)?;
+    let raw_16k_opt = if opts.vocal_isolation && decoded.is_stereo {
+        Some(resample_to_16k(&raw_mono, decoded.sample_rate)?)
+    } else {
+        None
+    };
+    let raw_ref = raw_16k_opt.as_deref().unwrap_or(&vocal_16k);
     let env10 = compute_vocal_envelope_10ms(&vocal_16k);
 
     let mut cached_aligner: Option<(String, WhisperAligner)> = None;
@@ -152,17 +163,18 @@ where
         None => (false, Vec::new()),
     };
 
-    let sample_for_lang = {
-        let start = (vocal_16k.len() / 5).min(vocal_16k.len());
-        let end = (start + 30 * 16000).min(vocal_16k.len());
-        &vocal_16k[start..end]
-    };
+    let lyrics_hint: String = input_lines
+        .iter()
+        .map(|l| split_role_prefix(&l.text).1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sample_for_lang = best_30s_vocal_window(&env10, raw_ref);
     let lang = if let Some(l) = opts.language.as_deref().filter(|s| !s.is_empty() && *s != "auto") {
         l.to_string()
-    } else if input_lines.iter().any(|l| has_japanese(&l.text)) {
-        "ja".to_string()
     } else {
-        aligner.detect_language(sample_for_lang).unwrap_or_else(|_| "en".to_string())
+        aligner
+            .detect_language_with_hint(sample_for_lang, &lyrics_hint)
+            .unwrap_or_else(|_| "en".to_string())
     };
     on_progress(0.48, format!("Using language '{lang}' on {device_used}"));
 
@@ -198,18 +210,26 @@ where
             format!("Aligning line {}/{}: {}", i + 1, total_lines, line.text),
         );
 
-        let words = segment_line_words(&line.text);
+        let (role_prefix, body_text) = split_role_prefix(&line.text);
+        let words = segment_line_words(body_text);
         if words.is_empty() {
             continue;
         }
 
+        let prev_end = aligned_lines.last().map(|l: &AlignedLine| l.end).unwrap_or(0.0);
         let t_s = line.timestamp.max(0.0).min(duration);
         let t_next = if i + 1 < input_lines.len() {
             input_lines[i + 1].timestamp
         } else {
             duration
         };
-        let unit_count = words.len().max(line.text.chars().count() / 3);
+        let pre_roll = if is_synced {
+            0.0
+        } else {
+            (t_s - prev_end).clamp(0.0, 0.30)
+        };
+        let ctx_s = (t_s - pre_roll).max(prev_end);
+        let unit_count = words.len().max(body_text.chars().count() / 3);
         let max_win = if t_next - t_s > 9.0 {
             (2.2 + unit_count as f64 * 0.58).clamp(4.0, 8.5)
         } else {
@@ -219,41 +239,57 @@ where
         let t_end_active = find_active_end(&env10, t_s, t_max).max(t_s + 0.25);
 
         let islands = if opts.pause_snapping {
-            detect_vocal_islands(&env10, t_s, t_end_active, 250)
+            detect_vocal_islands(&env10, ctx_s, t_end_active, 250)
         } else {
-            vec![(t_s, t_end_active)]
+            vec![(ctx_s, t_end_active)]
         };
 
         let mut word_spans = align_line_with_islands(
             &mut aligner,
             &vocal_16k,
+            raw_16k_opt.as_deref(),
             &env10,
+            ctx_s,
             t_s,
             t_end_active,
-            &line.text,
+            body_text,
             &words,
             &islands,
             &lang,
             opts.pause_snapping,
         )?;
 
-        // Clamp within [t_s, t_max] and enforce strictly monotonic order
-        let first_start = islands.first().map(|&(s, _)| s).unwrap_or(t_s).max(t_s);
-        let mut cursor = first_start;
+        // Clamp within [ctx_s, t_max] and enforce strictly monotonic order.
+        let line_anchor_floor = if is_synced { t_s.max(prev_end) } else { ctx_s };
+        let mut cursor = line_anchor_floor;
         for (wi, w) in word_spans.iter_mut().enumerate() {
-            w.start = w.start.max(cursor).min(t_max);
-            if wi == 0 {
-                w.start = first_start;
+            w.start = w.start.max(cursor).min(t_max - 0.02);
+            if wi == 0 && is_synced && w.start - line_anchor_floor > 0.35 {
+                // Keep synced line starts tight unless Whisper/pre-speech detected only a small silence offset.
+                w.start = line_anchor_floor;
             }
             w.end = w.end.max(w.start + 0.02).min(t_max);
             cursor = w.end;
         }
 
+        if !role_prefix.is_empty() {
+            if let Some(first) = word_spans.first_mut() {
+                first.text = format!("{role_prefix}{}", first.text);
+            }
+        }
+
+        let line_start = word_spans.first().map(|w| w.start).unwrap_or(t_s);
         let line_end = word_spans.last().map(|w| w.end).unwrap_or(t_end_active);
+        let line_conf = if word_spans.is_empty() {
+            0.0
+        } else {
+            word_spans.iter().map(|w| w.confidence).sum::<f32>() / word_spans.len() as f32
+        };
         aligned_lines.push(AlignedLine {
-            start: t_s,
+            start: line_start,
             end: line_end,
             text: line.text.clone(),
+            confidence: line_conf,
             words: word_spans,
         });
     }
@@ -264,6 +300,17 @@ where
     }
 
     let aligned_lines = shift_aligned_lines(&aligned_lines, opts.offset_ms);
+    let total_words: usize = aligned_lines.iter().map(|l| l.words.len()).sum();
+    let overall_confidence = if total_words == 0 {
+        0.0
+    } else {
+        aligned_lines
+            .iter()
+            .flat_map(|l| l.words.iter())
+            .map(|w| w.confidence)
+            .sum::<f32>()
+            / total_words as f32
+    };
 
     let enhanced_lrc = format_enhanced_lrc(
         &aligned_lines,
@@ -282,9 +329,10 @@ where
     on_progress(
         1.0,
         format!(
-            "Done! Aligned {} lines in {:.2}s.",
+            "Done! Aligned {} lines in {:.2}s ({:.0}% confidence).",
             aligned_lines.len(),
-            elapsed
+            elapsed,
+            overall_confidence * 100.0
         ),
     );
 
@@ -292,6 +340,7 @@ where
         metadata,
         device_used,
         language: lang,
+        confidence: overall_confidence,
         enhanced_lrc,
         wlrc,
         lines: aligned_lines,
@@ -299,12 +348,59 @@ where
     })
 }
 
+fn best_30s_vocal_window<'a>(env10: &[f32], audio_16k: &'a [f32]) -> &'a [f32] {
+    let win_samples = 30 * 16000;
+    if audio_16k.len() <= win_samples || env10.len() <= 3000 {
+        return audio_16k;
+    }
+    let env_win = 3000usize;
+    let mut cur_sum: f32 = env10[..env_win].iter().sum();
+    let mut best_sum = cur_sum;
+    let mut best_idx = 0usize;
+    for i in env_win..env10.len() {
+        cur_sum += env10[i] - env10[i - env_win];
+        if cur_sum > best_sum {
+            best_sum = cur_sum;
+            best_idx = i + 1 - env_win;
+        }
+    }
+    let start_sample = (best_idx * 160).min(audio_16k.len().saturating_sub(win_samples));
+    let end_sample = (start_sample + win_samples).min(audio_16k.len());
+    &audio_16k[start_sample..end_sample]
+}
+
+fn align_segment_best_source(
+    aligner: &mut WhisperAligner,
+    vocal_16k: &[f32],
+    raw_16k: Option<&[f32]>,
+    t0: f64,
+    t1: f64,
+    clean: &str,
+    lang: &str,
+) -> Result<AlignmentResult> {
+    let seg_vocal = slice_16k(vocal_16k, t0, t1);
+    let best = aligner.align_segment(seg_vocal, clean, lang)?;
+    if best.confidence < 0.55 {
+        if let Some(raw) = raw_16k {
+            let seg_raw = slice_16k(raw, t0, t1);
+            if let Ok(raw_res) = aligner.align_segment(seg_raw, clean, lang) {
+                if raw_res.confidence > best.confidence {
+                    return Ok(raw_res);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn align_line_with_islands(
     aligner: &mut WhisperAligner,
     vocal_16k: &[f32],
+    raw_16k: Option<&[f32]>,
     env10: &[f32],
-    t_s: f64,
+    ctx_s: f64,
+    _t_s: f64,
     t_end_active: f64,
     orig_line: &str,
     words: &[String],
@@ -329,16 +425,15 @@ fn align_line_with_islands(
                     text: clause_words[0].clone(),
                     start: *sub_s,
                     end: *sub_e,
+                    confidence: 0.70,
                 });
             } else {
                 let joined: String = clause_words.iter().map(String::as_str).collect();
                 let clean = clean_for_whisper(&joined);
-                let seg = slice_16k(vocal_16k, *sub_s, *sub_e);
-                let units = aligner.align_segment(seg, &clean, lang)?;
-                let mut spans = map_units_to_words(&units, clause_words, *sub_s, *sub_e);
-                if let Some(first) = spans.first_mut() {
-                    first.start = *sub_s;
-                }
+                let res = align_segment_best_source(
+                    aligner, vocal_16k, raw_16k, *sub_s, *sub_e, &clean, lang,
+                )?;
+                let mut spans = map_units_to_words(&res.units, clause_words, *sub_s, *sub_e, res.confidence);
                 if let Some(last) = spans.last_mut() {
                     last.end = last.end.min(*sub_e);
                 }
@@ -348,11 +443,12 @@ fn align_line_with_islands(
         return Ok(out);
     }
 
-    let first_s = islands.first().map(|&(s, _)| s).unwrap_or(t_s);
+    let first_s = islands.first().map(|&(s, _)| s).unwrap_or(ctx_s);
     let clean = clean_for_whisper(orig_line);
-    let seg = slice_16k(vocal_16k, first_s, t_end_active);
-    let units = aligner.align_segment(seg, &clean, lang)?;
-    let mut spans = map_units_to_words(&units, words, first_s, t_end_active);
+    let res = align_segment_best_source(
+        aligner, vocal_16k, raw_16k, first_s, t_end_active, &clean, lang,
+    )?;
+    let mut spans = map_units_to_words(&res.units, words, first_s, t_end_active, res.confidence);
 
     if pause_snapping && islands.len() >= 2 && spans.len() >= 2 {
         for g_idx in 0..islands.len() - 1 {
@@ -459,8 +555,9 @@ fn map_units_to_words(
     words: &[String],
     offset_sec: f64,
     fallback_end: f64,
+    fallback_conf: f32,
 ) -> Vec<WordSpan> {
-    let mut char_times: Vec<(char, f64, f64)> = Vec::new();
+    let mut char_times: Vec<(char, f64, f64, f32)> = Vec::new();
     for u in units {
         let clean_u = strip_punct_and_space(&u.text);
         let chars: Vec<char> = clean_u.chars().collect();
@@ -473,6 +570,7 @@ fn map_units_to_words(
                 ch,
                 offset_sec + u.start + idx as f64 * dt,
                 offset_sec + u.start + (idx + 1) as f64 * dt,
+                u.confidence,
             ));
         }
     }
@@ -480,7 +578,7 @@ fn map_units_to_words(
     let total_clean_chars: usize = words.iter().map(|w| strip_punct_and_space(w).chars().count()).sum();
     if char_times.is_empty() || char_times.len() != total_clean_chars {
         // Fallback: proportional interpolation across [offset_sec, fallback_end] if tokenizer altered chars (e.g. NFKC/numbers)
-        return proportional_map(units, words, offset_sec, fallback_end);
+        return proportional_map(units, words, offset_sec, fallback_end, fallback_conf * 0.75);
     }
 
     let mut ci = 0usize;
@@ -494,16 +592,20 @@ fn map_units_to_words(
                 text: w.clone(),
                 start: prev_end,
                 end: (prev_end + 0.1).min(fallback_end),
+                confidence: fallback_conf * 0.7,
             });
             continue;
         }
         let s = char_times[ci].1;
         let e = char_times[ci + count - 1].2;
+        let conf_sum: f32 = char_times[ci..ci + count].iter().map(|x| x.3).sum();
+        let conf = conf_sum / count as f32;
         ci += count;
         spans.push(WordSpan {
             text: w.clone(),
             start: s,
             end: e.max(s + 0.02),
+            confidence: conf,
         });
     }
     spans
@@ -514,6 +616,7 @@ fn proportional_map(
     words: &[String],
     offset_sec: f64,
     fallback_end: f64,
+    conf: f32,
 ) -> Vec<WordSpan> {
     let t0 = units
         .first()
@@ -541,6 +644,7 @@ fn proportional_map(
                 text: w.clone(),
                 start: s,
                 end: e.max(s + 0.02),
+                confidence: conf,
             }
         })
         .collect()

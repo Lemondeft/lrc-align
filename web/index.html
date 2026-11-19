@@ -387,6 +387,9 @@
     transition: background 0.15s ease, border-color 0.15s ease;
   }
   .k-line-btn:hover { background: rgba(255, 255, 255, 0.04); }
+  .k-line-btn.low-conf {
+    border-left: 2px solid rgba(249, 171, 0, 0.6);
+  }
   .k-line-btn.active {
     background: rgba(77, 163, 255, 0.08);
     border-color: rgba(77, 163, 255, 0.35);
@@ -1014,7 +1017,8 @@ function showResult(out) {
   $('offsetInput').value = '0';
   $('emptyResult').style.display = 'none';
   $('resultPanel').style.display = 'block';
-  $('resultSummary').textContent = `${out.lines.length} lines | ${out.language} | ${out.device_used} | ${out.elapsed_secs.toFixed(1)}s`;
+  const confPct = Math.round((out.confidence || 0) * 100);
+  $('resultSummary').textContent = `${out.lines.length} lines | ${out.language} | ${confPct}% conf | ${out.device_used} | ${out.elapsed_secs.toFixed(1)}s`;
   ensurePlayablePreview();
   renderOutputText();
   buildKaraoke(getShiftedLines());
@@ -1039,7 +1043,7 @@ function getShiftedLines() {
     });
     const start = words.length ? words[0].start : Math.max(0, line.start + dt);
     const end = words.length ? words[words.length - 1].end : Math.max(start + 0.02, line.end + dt);
-    return { start, end, text: line.text, words };
+    return { start, end, text: line.text, confidence: line.confidence, words };
   });
 }
 
@@ -1222,8 +1226,10 @@ function buildKaraoke(lines) {
   karaokeNodes = lines.map(line => {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'k-line-btn';
+    const conf = typeof line.confidence === 'number' ? line.confidence : 1;
+    btn.className = conf < 0.5 ? 'k-line-btn low-conf' : 'k-line-btn';
     btn.setAttribute('aria-label', `Seek to ${line.text}`);
+    btn.title = `Confidence: ${Math.round(conf * 100)}%`;
     const wordEls = line.words.map(w => {
       const span = document.createElement('span');
       span.className = 'k-word';

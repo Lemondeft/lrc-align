@@ -17,6 +17,7 @@ pub struct WordSpan {
     pub text: String,
     pub start: f64,
     pub end: f64,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -24,6 +25,7 @@ pub struct AlignedLine {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    pub confidence: f32,
     pub words: Vec<WordSpan>,
 }
 
@@ -55,8 +57,33 @@ pub fn is_ignorable_punct_or_space(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,
-            '、' | '。' | '！' | '？' | '…' | '・' | ',' | '.' | '!' | '?' | '~' | '〜' | '「' | '」' | '(' | ')' | '（' | '）' | '"' | '\'' | '♪'
+            '、' | '。' | '！' | '？' | '…' | '・' | ',' | '.' | '!' | '?' | ':' | ';' | '~' | '〜' | '「' | '」' | '(' | ')' | '（' | '）' | '"' | '\'' | '♪'
         )
+}
+
+/// Split leading vocalist tags like `v1:`, `v2:`, or `bg:` from sung text so alignment
+/// aligns only sung words while preserving the prefix on the formatted output.
+pub fn split_role_prefix(line: &str) -> (&str, &str) {
+    let Some(colon_idx) = line.find(':') else {
+        return ("", line);
+    };
+    let head = line[..colon_idx].trim();
+    let lower = head.to_ascii_lowercase();
+    let is_role = lower == "bg"
+        || lower == "all"
+        || (lower.starts_with('v') && lower.len() >= 2 && lower[1..].chars().all(|c| c.is_ascii_digit()));
+    if !is_role {
+        return ("", line);
+    }
+    let after_colon = &line[colon_idx + 1..];
+    let ws_len = after_colon
+        .char_indices()
+        .take_while(|(_, c)| c.is_whitespace())
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let split_at = colon_idx + 1 + ws_len;
+    (&line[..split_at], &line[split_at..])
 }
 
 pub fn strip_punct_and_space(s: &str) -> String {
@@ -325,6 +352,7 @@ pub fn shift_aligned_lines(lines: &[AlignedLine], offset_ms: f64) -> Vec<Aligned
                         text: w.text.clone(),
                         start: s,
                         end: e,
+                        confidence: w.confidence,
                     }
                 })
                 .collect();
@@ -340,6 +368,7 @@ pub fn shift_aligned_lines(lines: &[AlignedLine], offset_ms: f64) -> Vec<Aligned
                 start,
                 end,
                 text: line.text.clone(),
+                confidence: line.confidence,
                 words,
             }
         })
@@ -383,10 +412,12 @@ mod tests {
             start: 2.13,
             end: 2.77,
             text: "言って".into(),
+            confidence: 0.9,
             words: vec![WordSpan {
                 text: "言って".into(),
                 start: 2.13,
                 end: 2.77,
+                confidence: 0.9,
             }],
         }];
         let elrc = format_enhanced_lrc(&lines, Some("言って。"), Some("Yorushika"), None);
@@ -402,16 +433,19 @@ mod tests {
             start: 0.10,
             end: 0.60,
             text: "Hi there".into(),
+            confidence: 0.85,
             words: vec![
                 WordSpan {
                     text: "Hi ".into(),
                     start: 0.10,
                     end: 0.25,
+                    confidence: 0.85,
                 },
                 WordSpan {
                     text: "there".into(),
                     start: 0.25,
                     end: 0.60,
+                    confidence: 0.85,
                 },
             ],
         }];
@@ -420,5 +454,13 @@ mod tests {
         assert!((shifted[0].words[0].end - 0.05).abs() < 1e-6);
         assert!((shifted[0].words[1].start - 0.05).abs() < 1e-6);
         assert!((shifted[0].words[1].end - 0.40).abs() < 1e-6);
+    }
+
+    #[test]
+    fn splits_apple_music_role_prefixes_without_affecting_normal_colons() {
+        assert_eq!(split_role_prefix("v1:Kasur udah"), ("v1:", "Kasur udah"));
+        assert_eq!(split_role_prefix("v2: ohayou"), ("v2: ", "ohayou"));
+        assert_eq!(split_role_prefix("bg: yeah"), ("bg: ", "yeah"));
+        assert_eq!(split_role_prefix("10:00 AM"), ("", "10:00 AM"));
     }
 }

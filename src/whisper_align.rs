@@ -58,6 +58,13 @@ pub struct AlignedUnit {
     pub text: String,
     pub start: f64,
     pub end: f64,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlignmentResult {
+    pub units: Vec<AlignedUnit>,
+    pub confidence: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -541,8 +548,19 @@ impl WhisperAligner {
         Ok((mel, num_audio_frames.clamp(1, 1500)))
     }
 
-    /// Detect dominant language of an audio snippet (`"ja"`, `"en"`, etc.).
-    pub fn detect_language(&mut self, samples_16k: &[f32]) -> Result<String> {
+    /// Detect dominant language using acoustic Whisper logits combined with lyrics text priors.
+    pub fn detect_language_with_hint(
+        &mut self,
+        samples_16k: &[f32],
+        lyrics_hint: &str,
+    ) -> Result<String> {
+        if let Some(script_lang) = detect_script_language(lyrics_hint) {
+            return Ok(script_lang.to_string());
+        }
+        if let Some(text_lang) = strong_latin_lyrics_language(lyrics_hint) {
+            return Ok(text_lang.to_string());
+        }
+
         let (mel, _) = self.build_mel_30s(samples_16k)?;
         self.model.reset_kv_cache();
         let xa = self.model.encoder.forward(&mel, true)?;
@@ -555,18 +573,23 @@ impl WhisperAligner {
             .to_dtype(DType::F32)?;
         let logits_vec: Vec<f32> = logits.squeeze(0)?.to_vec1()?;
 
-        let candidates = ["ja", "en", "zh", "ko", "id", "es", "fr", "de"];
+        let text_bias = score_latin_lyrics_hint(lyrics_hint);
+        let candidates = ["ja", "en", "zh", "ko", "id", "ms", "es", "fr", "de", "pt", "it"];
         let mut best_lang = "en";
         let mut best_val = f32::NEG_INFINITY;
         for &lang in &candidates {
             if let Some(id) = self.tokenizer.token_to_id(&format!("<|{lang}|>")) {
                 if let Some(&v) = logits_vec.get(id as usize) {
-                    if v > best_val {
-                        best_val = v;
+                    let biased = v + text_bias(lang);
+                    if biased > best_val {
+                        best_val = biased;
                         best_lang = lang;
                     }
                 }
             }
+        }
+        if best_lang == "ms" && text_bias("id") > 0.0 {
+            return Ok("id".to_string());
         }
         Ok(best_lang.to_string())
     }
@@ -577,9 +600,12 @@ impl WhisperAligner {
         samples_16k: &[f32],
         clean_text: &str,
         lang: &str,
-    ) -> Result<Vec<AlignedUnit>> {
+    ) -> Result<AlignmentResult> {
         if clean_text.is_empty() || samples_16k.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AlignmentResult {
+                units: Vec::new(),
+                confidence: 0.0,
+            });
         }
         let encoding = self
             .tokenizer
@@ -587,7 +613,10 @@ impl WhisperAligner {
             .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
         let text_tokens: Vec<u32> = encoding.get_ids().to_vec();
         if text_tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(AlignmentResult {
+                units: Vec::new(),
+                confidence: 0.0,
+            });
         }
 
         let max_ctx = self.model.config.max_target_positions;
@@ -671,18 +700,7 @@ impl WhisperAligner {
             *v *= inv_h;
         }
 
-        let (text_idx, time_idx) = dtw(&avg_matrix, n_text_plus_eot, num_frames);
-
-        let mut jump_times = Vec::with_capacity(n_text_plus_eot);
-        for k in 0..text_idx.len() {
-            if k == 0 || text_idx[k] != text_idx[k - 1] {
-                jump_times.push(time_idx[k] as f64 / 50.0);
-            }
-        }
-        while jump_times.len() < n_text_plus_eot {
-            let last = *jump_times.last().unwrap_or(&0.0);
-            jump_times.push(last);
-        }
+        let (jump_times, tok_conf) = dtw_with_pre_speech(&avg_matrix, text_tokens.len(), num_frames);
 
         // Merge BPE tokens into valid complete Unicode chunks (preventing split UTF-8 characters)
         let mut units = Vec::new();
@@ -698,11 +716,14 @@ impl WhisperAligner {
             if !decoded.contains('\u{FFFD}') {
                 let start = jump_times[group_start_tok];
                 let end = jump_times[ti + 1];
+                let conf_slice = &tok_conf[group_start_tok..=ti];
+                let conf = conf_slice.iter().copied().sum::<f32>() / conf_slice.len().max(1) as f32;
                 if !decoded.is_empty() {
                     units.push(AlignedUnit {
                         text: decoded,
                         start,
                         end: end.max(start),
+                        confidence: conf,
                     });
                 }
                 acc_ids.clear();
@@ -719,15 +740,27 @@ impl WhisperAligner {
             if !decoded.is_empty() {
                 let start = jump_times[group_start_tok];
                 let end = jump_times[text_tokens.len()];
+                let conf_slice = &tok_conf[group_start_tok..text_tokens.len()];
+                let conf = conf_slice.iter().copied().sum::<f32>() / conf_slice.len().max(1) as f32;
                 units.push(AlignedUnit {
                     text: decoded,
                     start,
                     end: end.max(start),
+                    confidence: conf,
                 });
             }
         }
 
-        Ok(units)
+        let seg_conf = if units.is_empty() {
+            0.0
+        } else {
+            units.iter().map(|u| u.confidence).sum::<f32>() / units.len() as f32
+        };
+
+        Ok(AlignmentResult {
+            units,
+            confidence: seg_conf,
+        })
     }
 
     /// Coarse greedy transcription when no lyrics exist at all.
@@ -919,6 +952,146 @@ fn dtw(matrix: &[f32], n: usize, m: usize) -> (Vec<usize>, Vec<usize>) {
     (ti, tj)
 }
 
+/// Prepend a neutral pre-speech baseline row (`0.05` Z-score threshold) before `text_tokens[0]`
+/// so leading silence or breath in a padded window is absorbed instead of pinning word 0 to frame 0.
+/// Returns `(token_start_times_plus_eot, per_token_confidences)`.
+fn dtw_with_pre_speech(
+    avg_matrix: &[f32],
+    n_text_tokens: usize,
+    num_frames: usize,
+) -> (Vec<f64>, Vec<f32>) {
+    let n_text_plus_eot = n_text_tokens + 1;
+    let total_rows = 1 + n_text_plus_eot;
+    let mut padded = Vec::with_capacity(total_rows * num_frames);
+    padded.resize(num_frames, 0.05_f32);
+    padded.extend_from_slice(avg_matrix);
+
+    let (text_idx, time_idx) = dtw(&padded, total_rows, num_frames);
+
+    // Track `[first_frame, last_frame]` for each text/eot row (`row 1..=n_text_plus_eot`).
+    let mut first_frame = vec![None; n_text_plus_eot];
+    let mut last_frame = vec![0usize; n_text_plus_eot];
+    for (&r, &f) in text_idx.iter().zip(time_idx.iter()) {
+        if r >= 1 {
+            let tok = r - 1;
+            if tok < n_text_plus_eot {
+                if first_frame[tok].is_none() {
+                    first_frame[tok] = Some(f);
+                }
+                last_frame[tok] = f;
+            }
+        }
+    }
+
+    let mut jump_times = Vec::with_capacity(n_text_plus_eot);
+    let mut prev_t = 0.0_f64;
+    for tok in 0..n_text_plus_eot {
+        let t = first_frame[tok]
+            .map(|f| f as f64 / 50.0)
+            .unwrap_or(prev_t)
+            .max(prev_t);
+        prev_t = t;
+        jump_times.push(t);
+    }
+
+    let mut confidences = Vec::with_capacity(n_text_tokens);
+    for tok in 0..n_text_tokens {
+        let f_start = first_frame[tok].unwrap_or(0);
+        let f_end = last_frame[tok].max(f_start).min(num_frames - 1);
+        let row = &avg_matrix[tok * num_frames..(tok + 1) * num_frames];
+        let mut sum = 0.0_f32;
+        let mut peak = f32::NEG_INFINITY;
+        for &v in &row[f_start..=f_end] {
+            sum += v;
+            if v > peak {
+                peak = v;
+            }
+        }
+        let mean = sum / (f_end - f_start + 1) as f32;
+        let score = 0.60 * mean + 0.40 * peak;
+        let conf = (score / 1.90).clamp(0.05, 0.99);
+        confidences.push(conf);
+    }
+
+    (jump_times, confidences)
+}
+
+fn detect_script_language(text: &str) -> Option<&'static str> {
+    let mut jp = 0usize;
+    let mut ko = 0usize;
+    let mut han = 0usize;
+    let mut ru = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' => jp += 1,
+            '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' => ko += 1,
+            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' => han += 1,
+            '\u{0400}'..='\u{04FF}' => ru += 1,
+            _ => {}
+        }
+    }
+    if jp >= 3 {
+        Some("ja")
+    } else if ko >= 3 {
+        Some("ko")
+    } else if han >= 4 {
+        Some("zh")
+    } else if ru >= 4 {
+        Some("ru")
+    } else {
+        None
+    }
+}
+
+fn count_latin_stopwords(text: &str) -> (usize, usize) {
+    const ID_WORDS: &[&str] = &[
+        "yang", "dan", "ini", "itu", "aku", "gue", "gak", "tak", "tidak", "kini", "untuk",
+        "dalam", "dengan", "dari", "ke", "di", "ku", "kamu", "kau", "ingin", "lalu", "semua",
+        "jadi", "buat", "atau", "juga", "pada", "sudah", "udah", "akan",
+    ];
+    const EN_WORDS: &[&str] = &[
+        "the", "and", "you", "that", "this", "with", "for", "are", "was", "have", "not", "your",
+        "our", "why", "cause", "when", "what", "will", "from", "into", "just", "know", "like",
+        "love", "dont", "cant", "could", "would", "through", "again",
+    ];
+
+    let mut id_hits = 0usize;
+    let mut en_hits = 0usize;
+    for raw in text.split(|c: char| !c.is_alphanumeric() && c != '\'') {
+        let w = raw.to_ascii_lowercase();
+        if w.is_empty() {
+            continue;
+        }
+        if ID_WORDS.contains(&w.as_str()) {
+            id_hits += 1;
+        }
+        if EN_WORDS.contains(&w.as_str()) {
+            en_hits += 1;
+        }
+    }
+    (id_hits, en_hits)
+}
+
+fn strong_latin_lyrics_language(text: &str) -> Option<&'static str> {
+    let (id_hits, en_hits) = count_latin_stopwords(text);
+    if id_hits >= 3 && id_hits >= en_hits.saturating_mul(2).max(1) {
+        Some("id")
+    } else if en_hits >= 4 && en_hits >= id_hits.saturating_mul(3).max(1) {
+        Some("en")
+    } else {
+        None
+    }
+}
+
+fn score_latin_lyrics_hint(text: &str) -> impl Fn(&str) -> f32 {
+    let (id_hits, en_hits) = count_latin_stopwords(text);
+    move |lang: &str| match lang {
+        "id" | "ms" if id_hits >= 2 && id_hits > en_hits => 10.0,
+        "en" if en_hits >= 3 && en_hits > id_hits * 2 => 6.0,
+        _ => 0.0,
+    }
+}
+
 /// Compute Whisper 30s log-mel spectrogram by running STFT only over active audio frames
 /// and filling the silent remainder with the exact clamped silence floor.
 fn fast_whisper_mel_30s(samples: &[f32], n_mels: usize, filters: &[f32]) -> Result<Vec<f32>> {
@@ -994,8 +1167,29 @@ fn fast_whisper_mel_30s(samples: &[f32], n_mels: usize, filters: &[f32]) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_whisper_mel_filters, fast_whisper_mel_30s};
+    use super::{compute_whisper_mel_filters, dtw_with_pre_speech, fast_whisper_mel_30s};
     use candle_transformers::models::whisper as cw;
+
+    #[test]
+    fn pre_speech_anchor_finds_delayed_onset_instead_of_frame_zero() {
+        let n_tokens = 2usize;
+        let num_frames = 60usize;
+        let mut avg = vec![-0.8_f32; (n_tokens + 1) * num_frames];
+        // Silent intro for frames 0..25 (0.00s..0.50s), then tok 0 active at 25..40, tok 1 at 40..52, eot at 52..60.
+        for f in 25..40 {
+            avg[f] = 1.6;
+        }
+        for f in 40..52 {
+            avg[num_frames + f] = 1.6;
+        }
+        for f in 52..60 {
+            avg[2 * num_frames + f] = 1.6;
+        }
+        let (jumps, conf) = dtw_with_pre_speech(&avg, n_tokens, num_frames);
+        assert!((jumps[0] - 0.50).abs() <= 0.04, "expected ~0.50s, got {}", jumps[0]);
+        assert!((jumps[1] - 0.80).abs() <= 0.04, "expected ~0.80s, got {}", jumps[1]);
+        assert!(conf[0] > 0.8 && conf[1] > 0.8);
+    }
 
     #[test]
     fn fast_mel_matches_candle_pcm_to_mel() {

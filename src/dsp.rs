@@ -72,7 +72,9 @@ pub fn isolate_center_vocals(left: &[f32], right: &[f32], is_stereo: bool, sampl
         for k in 0..n_bins {
             let mag_m2 = spec_mid[k].norm_sqr();
             let mag_s2 = spec_side[k].norm_sqr();
-            let mask = ((mag_m2 - 1.5 * mag_s2).max(0.0)) / (mag_m2 + 1e-10);
+            let wiener = (mag_m2 - 0.9 * mag_s2).max(0.0) / (mag_m2 + 1e-10);
+            // Keep a 0.22 spectral floor so stereo-doubled singing and fricative consonants stay intact.
+            let mask = 0.22 + 0.78 * wiener;
             spec_mid[k] *= mask * freq_weights[k];
         }
         // RealFFT expects DC & Nyquist imaginary parts to be 0
