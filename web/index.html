@@ -650,11 +650,22 @@ async function locateOriginal(file) {
 
 async function loadAudioFile(file) {
   selectedAudioFile = file;
+  currentJobId = null;
+  lastOutput = null;
   previewFallbackApplied = false;
+  const player = $('audioPlayer');
+  player.pause();
+  player.removeAttribute('src');
+  player.load();
   if (audioUrl) URL.revokeObjectURL(audioUrl);
   audioUrl = URL.createObjectURL(file);
-  $('audioPlayer').src = audioUrl;
+  player.src = audioUrl;
+  player.load();
 
+  $('resultPanel').style.display = 'none';
+  $('emptyResult').style.display = 'block';
+  $('karaokeStage').innerHTML = '';
+  $('outputBox').value = '';
   $('fileStatus').textContent = `${file.name} (${(file.size / 1048576).toFixed(1)} MB)`;
   $('runBtn').disabled = false;
   $('runBtnText').disabled = false;
@@ -766,6 +777,8 @@ async function startRun() {
     activeSource.close();
     activeSource = null;
   }
+  currentJobId = null;
+  previewFallbackApplied = false;
   $('errorBanner').classList.remove('visible');
   setRunning(true);
   $('progressBar').style.width = '2%';
